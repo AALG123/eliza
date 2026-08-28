@@ -12,6 +12,7 @@ import {
   releaseProviderAdmission,
 } from "../../lib/services/provider-admission";
 import { closeDatabaseConnectionsForTests, dbWrite } from "../client";
+import { sqlRows } from "../execute-helpers";
 import { accountDeletionExports } from "../schemas/account-deletion-exports";
 import { accountDeletionPhaseReceipts } from "../schemas/account-deletion-phase-receipts";
 import { accountDeletionRequests } from "../schemas/account-deletion-requests";
@@ -28,12 +29,19 @@ const now = new Date("2026-08-22T12:00:00Z");
 const recoveryExpiresAt = new Date("2026-09-21T12:00:00Z");
 const BACKUP_ADMISSION_GUARD_SQL = await Promise.all(
   [
+    "0349_agent_backup_admission_cohort_authority.sql",
     "0353_agent_backup_admission_work_state_shapes.sql",
     "0354_agent_backup_admission_work_stage_policy.sql",
     "0355_agent_backup_admission_work_indexes.sql",
     "0356_agent_backup_admission_work_identity_guard.sql",
     "0357_agent_backup_admission_work_state_guard.sql",
     "0358_agent_backup_admission_work_delete_guard.sql",
+    "0359_agent_backup_admission_shard_guard.sql",
+    "0360_agent_backup_admission_claim_authority.sql",
+    "0361_agent_backup_admission_claim_seed.sql",
+    // 0362 is nontransactional index coverage owned by the migrator lane.
+    "0363_agent_backup_admission_claim_guard.sql",
+    "0364_agent_backup_admission_claim_eligibility.sql",
   ].map((name) => Bun.file(new URL(`../migrations/${name}`, import.meta.url)).text()),
 );
 const billingCancelMigrations = await Promise.all(
@@ -190,6 +198,19 @@ beforeAll(async () => {
       if (statement.trim()) await dbWrite.execute(statement);
     }
   }
+  const stateGuard = await sqlRows<{ definition: string }>(
+    dbWrite,
+    sql`
+      SELECT pg_get_functiondef(procedure.oid) AS definition
+      FROM pg_proc AS procedure
+      JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'public'
+        AND procedure.proname = 'guard_agent_backup_admission_work_state'
+    `,
+  );
+  expect(stateGuard).toHaveLength(1);
+  expect(stateGuard[0]?.definition).toContain("agent_backup_admission_effective_priority");
+  expect(stateGuard[0]?.definition).toContain("backup admission claim requires ready work");
 });
 afterAll(async () => {
   await closeDatabaseConnectionsForTests();

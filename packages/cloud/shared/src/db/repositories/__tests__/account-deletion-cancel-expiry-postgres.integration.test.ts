@@ -36,6 +36,7 @@ const REPLACEMENT_ATTEMPT_MIGRATIONS = [
   "0328_agent_sandbox_replacement_attempt_state_guard.sql",
 ] as const;
 const BACKUP_ADMISSION_GUARD_MIGRATIONS = [
+  "0349_agent_backup_admission_cohort_authority.sql",
   "0353_agent_backup_admission_work_state_shapes.sql",
   "0354_agent_backup_admission_work_stage_policy.sql",
   "0355_agent_backup_admission_work_indexes.sql",
@@ -43,6 +44,11 @@ const BACKUP_ADMISSION_GUARD_MIGRATIONS = [
   "0357_agent_backup_admission_work_state_guard.sql",
   "0358_agent_backup_admission_work_delete_guard.sql",
   "0359_agent_backup_admission_shard_guard.sql",
+  "0360_agent_backup_admission_claim_authority.sql",
+  "0361_agent_backup_admission_claim_seed.sql",
+  // 0362 is nontransactional index coverage owned by the migrator lane.
+  "0363_agent_backup_admission_claim_guard.sql",
+  "0364_agent_backup_admission_claim_eligibility.sql",
 ] as const;
 const BILLING_CANCEL_MIGRATIONS = [
   "0335_billing_cancel_commands.sql",
@@ -487,6 +493,16 @@ beforeAll(async () => {
   await applyBillingCancelMigrations(control);
   await applyMigrations(control, REPLACEMENT_ATTEMPT_MIGRATIONS);
   await applyMigrations(control, BACKUP_ADMISSION_GUARD_MIGRATIONS);
+  const stateGuard = await control.query<{ definition: string }>(`
+    SELECT pg_get_functiondef(procedure.oid) AS definition
+    FROM pg_proc AS procedure
+    JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+    WHERE namespace.nspname = 'public'
+      AND procedure.proname = 'guard_agent_backup_admission_work_state'
+  `);
+  expect(stateGuard.rows).toHaveLength(1);
+  expect(stateGuard.rows[0]?.definition).toContain("agent_backup_admission_effective_priority");
+  expect(stateGuard.rows[0]?.definition).toContain("backup admission claim requires ready work");
 }, TEST_TIMEOUT);
 
 afterAll(async () => {
