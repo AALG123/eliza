@@ -56,6 +56,7 @@ import {
   sharedRealtimePromptPolicy,
 } from "./shared-realtime-grounding";
 import type { SharedRuntimeChannel } from "./shared-runtime-channel";
+import { SharedRuntimeTurnError } from "./shared-runtime-errors";
 import { sharedPublicWebGrounding } from "./shared-runtime-history-policy";
 import type {
   SharedProviderTimingReceipt,
@@ -682,9 +683,9 @@ export async function runSharedAgentTurn(
   } catch (error) {
     // error-policy:J2 the runtime is the sole inference engine; preserve its
     // cause while adding the agent/model identity used by billing boundaries.
-    throw new Error(
+    throw new SharedRuntimeTurnError(
       `[shared-runtime] AgentRuntime turn failed (agent=${input.character.name}, model=${modelId})`,
-      { cause: error },
+      error,
     );
   }
   if (realtimeRequirement) {
