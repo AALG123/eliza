@@ -29,6 +29,8 @@ const migrationNames = [
   "0361_agent_backup_admission_claim_seed.sql",
   "0362_agent_backup_admission_claim_indexes.sql",
   "0363_agent_backup_admission_claim_guard.sql",
+  "0364_agent_backup_admission_claim_eligibility.sql",
+  "0365_agent_backup_admission_unsettled_schedule_index.sql",
 ] as const;
 const migrations = await Promise.all(
   migrationNames.map((name) => Bun.file(new URL(`./${name}`, import.meta.url)).text()),
@@ -52,6 +54,20 @@ const DUE = "2026-08-20 00:00:00+00";
 const DEADLINE = "2026-08-20 00:15:00+00";
 const CONTAINER = "a".repeat(64);
 const IMAGE = `sha256:${"b".repeat(64)}`;
+
+interface ScheduleInsertOptions {
+  sourceDue?: string;
+  rpoDeadline?: string;
+  notBefore?: string;
+  shardId?: number;
+}
+
+interface ClaimCycleOptions {
+  maxCohort?: number;
+  maxOrdinal?: number;
+  maxId?: string;
+  observedAt?: string;
+}
 
 async function applyAll(db: PGlite): Promise<void> {
   for (const migration of migrations) {
@@ -147,6 +163,7 @@ async function insertSchedule(
   organizationId: string,
   sandboxId: string,
   historyId: string,
+  options: ScheduleInsertOptions = {},
 ): Promise<void> {
   await db.query(
     `INSERT INTO agent_backup_admission_work (
@@ -157,20 +174,39 @@ async function insertSchedule(
        ready_cohort, cohort_ordinal, shard_id
      ) VALUES ($1::uuid, 'schedule_capture', 'reserve_capture', $2::uuid, $3::uuid,
        $4::uuid, $5::uuid, 7, 'sandbox-provider', $6, $7, 900000, TRUE,
-       'periodic_capture', 3, $8::timestamptz, $9::timestamptz, $8::timestamptz,
-       1, 0, agent_backup_admission_expected_shard($3::uuid))`,
-    [id, organizationId, sandboxId, historyId, ACTIVATION, CONTAINER, IMAGE, DUE, DEADLINE],
+       'periodic_capture', 3, $8::timestamptz, $9::timestamptz, $10::timestamptz,
+       1, 0, COALESCE($11::smallint, agent_backup_admission_expected_shard($3::uuid)))`,
+    [
+      id,
+      organizationId,
+      sandboxId,
+      historyId,
+      ACTIVATION,
+      CONTAINER,
+      IMAGE,
+      options.sourceDue ?? DUE,
+      options.rpoDeadline ?? DEADLINE,
+      options.notBefore ?? options.sourceDue ?? DUE,
+      options.shardId ?? null,
+    ],
   );
 }
 
-async function startScheduleClaimCycle(db: PGlite): Promise<void> {
-  await db.exec(`UPDATE agent_backup_admission_claim_shards
+async function startScheduleClaimCycle(db: PGlite, options: ClaimCycleOptions = {}): Promise<void> {
+  await db.query(
+    `UPDATE agent_backup_admission_claim_shards
     SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
-      cycle_observed_at = clock_timestamp(), cycle_max_cohort = 42,
-      cycle_max_ordinal = 99,
-      cycle_max_id = '20000000-0000-4fff-bfff-ffffffffffff',
+      cycle_observed_at = $1::timestamptz, cycle_max_cohort = $2,
+      cycle_max_ordinal = $3, cycle_max_id = $4::uuid,
       cycle_aging_interval_ms = 900000, priority_pass = 0
-    WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
+    WHERE work_kind = 'schedule_capture' AND shard_id = 32`,
+    [
+      options.observedAt ?? "2000-01-01 00:00:00+00",
+      options.maxCohort ?? 42,
+      options.maxOrdinal ?? 99,
+      options.maxId ?? "80000000-0000-4fff-bfff-ffffffffffff",
+    ],
+  );
 }
 
 afterEach(async () => {
@@ -228,6 +264,7 @@ describe("backup admission cohort migrations", () => {
 
     const expectedWorkIndexes = [
       "agent_backup_admission_work_schedule_uidx",
+      "agent_backup_admission_work_unsettled_schedule_uidx",
       "agent_backup_admission_work_operation_stage_uidx",
       "agent_backup_admission_work_gc_uidx",
       "agent_backup_admission_work_organization_idx",
@@ -289,13 +326,15 @@ describe("backup admission cohort migrations", () => {
       name: string;
       columns: string;
       predicate: string | null;
+      unique: boolean;
     }>(`
       SELECT index_relation.relname AS name,
         (SELECT string_agg(attribute.attname, ',' ORDER BY key.ordinality)
           FROM unnest(index_record.indkey) WITH ORDINALITY AS key(attnum, ordinality)
           JOIN pg_attribute attribute ON attribute.attrelid = index_record.indrelid
             AND attribute.attnum = key.attnum) AS columns,
-        pg_get_expr(index_record.indpred, index_record.indrelid) AS predicate
+        pg_get_expr(index_record.indpred, index_record.indrelid) AS predicate,
+        index_record.indisunique AS unique
       FROM pg_index index_record
       JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid
       WHERE index_relation.relname IN (
@@ -304,6 +343,7 @@ describe("backup admission cohort migrations", () => {
         'agent_backup_admission_work_deferred_ready_shard_idx',
         'agent_backup_admission_work_expired_lease_shard_idx',
         'agent_backup_admission_work_organization_idx',
+        'agent_backup_admission_work_unsettled_schedule_uidx',
         'agent_sandbox_backups_admission_active_org_idx',
         'agent_sandbox_backups_admission_capture_history_idx',
         'agent_sandbox_backups_admission_capture_fallback_idx'
@@ -332,6 +372,10 @@ describe("backup admission cohort migrations", () => {
         columns: "organization_id,id",
       },
       {
+        name: "agent_backup_admission_work_unsettled_schedule_uidx",
+        columns: "sandbox_id,source_activation_generation,source_lifecycle_revision",
+      },
+      {
         name: "agent_sandbox_backups_admission_active_org_idx",
         columns: "catalog_organization_id",
       },
@@ -358,6 +402,14 @@ describe("backup admission cohort migrations", () => {
       /state.*leased/i,
     );
     expect(predicateByIndex.get("agent_backup_admission_work_organization_idx")).toBeNull();
+    expect(predicateByIndex.get("agent_backup_admission_work_unsettled_schedule_uidx")).toMatch(
+      /work_kind.*schedule_capture.*state.*settled/is,
+    );
+    expect(
+      indexShapes.rows.find(
+        ({ name }) => name === "agent_backup_admission_work_unsettled_schedule_uidx",
+      )?.unique,
+    ).toBe(true);
     expect(predicateByIndex.get("agent_sandbox_backups_admission_active_org_idx")).toMatch(
       /catalog_state.*scheduled.*capturing.*captured.*uploading.*primary_uploaded.*primary_verified.*secondary_pending.*failed_retryable/is,
     );
@@ -386,6 +438,19 @@ describe("backup admission cohort migrations", () => {
       await explainIndex(`SELECT 1 FROM agent_backup_admission_work
         WHERE organization_id = '${ORG_A}' ORDER BY id`),
     ).toContain("agent_backup_admission_work_organization_idx");
+    expect(
+      await explainIndex(`SELECT 1 FROM agent_backup_admission_work
+        WHERE work_kind = 'schedule_capture' AND sandbox_id = '${SANDBOX_A}'
+          AND source_activation_generation = '${ACTIVATION}'
+          AND source_lifecycle_revision = 7 AND state <> 'settled'`),
+    ).toContain("agent_backup_admission_work_unsettled_schedule_uidx");
+    expect(
+      await explainIndex(`SELECT 1 FROM agent_backup_admission_work
+        WHERE work_kind = 'schedule_capture' AND sandbox_id = '${SANDBOX_A}'
+          AND node_history_id = '${HISTORY_A}'
+          AND source_activation_generation = '${ACTIVATION}'
+          AND source_lifecycle_revision = 7 AND source_due_at = '${DUE}'`),
+    ).toContain("agent_backup_admission_work_schedule_uidx");
     expect(
       await explainIndex(`SELECT 1 FROM agent_sandbox_backups
         WHERE catalog_organization_id = '${ORG_A}'
@@ -485,7 +550,7 @@ describe("backup admission cohort migrations", () => {
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         cycle_observed_at = clock_timestamp(), cycle_max_cohort = 42,
         cycle_max_ordinal = 99,
-        cycle_max_id = '20000000-0000-4fff-bfff-ffffffffffff',
+        cycle_max_id = '80000000-0000-4fff-bfff-ffffffffffff',
         cycle_aging_interval_ms = 900000, priority_pass = 0,
         updated_at = clock_timestamp()
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
@@ -498,7 +563,7 @@ describe("backup admission cohort migrations", () => {
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         scan_cursor_cohort = 1, scan_cursor_ordinal = 0,
-        scan_cursor_id = '20000000-0000-4000-8000-000000000001',
+        scan_cursor_id = '80000000-0000-4000-8000-000000000001',
         updated_at = clock_timestamp()
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
     await expect(
@@ -563,7 +628,7 @@ describe("backup admission cohort migrations", () => {
         last_turn: "3",
         max_cohort: "42",
         max_ordinal: 99,
-        max_id: "20000000-0000-4fff-bfff-ffffffffffff",
+        max_id: "80000000-0000-4fff-bfff-ffffffffffff",
         cursor_cohort: "1",
       },
     ]);
@@ -577,6 +642,166 @@ describe("backup admission cohort migrations", () => {
       db.exec(`DELETE FROM agent_backup_admission_claim_shards
         WHERE work_kind = 'schedule_capture' AND shard_id = 32`),
     ).rejects.toThrow(/cannot be removed/i);
+  });
+
+  test("keeps source sharding distinct from opaque claim work IDs", async () => {
+    const db = await database();
+    const WORK = "80000000-0000-4000-8000-000000000041";
+    const clock = await db.query<{ before: string; due: string; deadline: string }>(`
+      SELECT statement_timestamp()::text AS before,
+        (statement_timestamp() - interval '1 hour')::text AS due,
+        (statement_timestamp() - interval '45 minutes')::text AS deadline
+    `);
+    const timing = clock.rows[0];
+    if (!timing) throw new Error("database clock fixture is missing");
+    const shards = await db.query<{ source_shard: number; work_id_hash: number }>(`
+      SELECT agent_backup_admission_expected_shard('${SANDBOX_A}') AS source_shard,
+        agent_backup_admission_expected_shard('${WORK}') AS work_id_hash
+    `);
+    expect(shards.rows).toEqual([{ source_shard: 32, work_id_hash: 0 }]);
+    await expect(
+      insertSchedule(db, WORK, ORG_A, SANDBOX_A, HISTORY_A, {
+        sourceDue: timing.due,
+        rpoDeadline: timing.deadline,
+        notBefore: timing.due,
+        shardId: 0,
+      }),
+    ).rejects.toThrow(/agent_backup_admission_work_counters_check/i);
+    await insertSchedule(db, WORK, ORG_A, SANDBOX_A, HISTORY_A, {
+      sourceDue: timing.due,
+      rpoDeadline: timing.deadline,
+      notBefore: timing.due,
+    });
+    await startScheduleClaimCycle(db, { maxCohort: 1, maxOrdinal: 0, maxId: WORK });
+    const authority = await db.query<{ database_owned: boolean; max_id: string }>(
+      `SELECT cycle_observed_at >= $1::timestamptz
+          AND cycle_observed_at <= statement_timestamp() AS database_owned,
+          cycle_max_id::text AS max_id
+        FROM agent_backup_admission_claim_shards
+        WHERE work_kind = 'schedule_capture' AND shard_id = 32`,
+      [timing.before],
+    );
+    expect(authority.rows).toEqual([{ database_owned: true, max_id: WORK }]);
+    await db.exec(`UPDATE agent_backup_admission_claim_shards
+      SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
+        scan_cursor_cohort = 1, scan_cursor_ordinal = 0, scan_cursor_id = '${WORK}'
+      WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
+    await db.exec(`UPDATE agent_backup_admission_work
+      SET state = 'leased', lease_owner = 'opaque-work-id',
+        lease_generation = '93000000-0000-4000-8000-000000000041',
+        lease_expires_at = statement_timestamp() + interval '1 hour', attempts = attempts + 1
+      WHERE id = '${WORK}'`);
+    const proof = await db.query<{
+      work_id: string;
+      max_id: string;
+      cursor_id: string;
+      work_shard: number;
+      proof_pass: number;
+      effective_priority: number;
+    }>(`SELECT work.id::text AS work_id, shard.cycle_max_id::text AS max_id,
+        shard.scan_cursor_id::text AS cursor_id, work.shard_id AS work_shard,
+        work.claim_proof_priority_pass AS proof_pass,
+        agent_backup_admission_effective_priority(work.base_priority,
+          work.first_eligible_at, shard.cycle_observed_at,
+          shard.cycle_aging_interval_ms) AS effective_priority
+      FROM agent_backup_admission_work work
+      JOIN agent_backup_admission_claim_shards shard
+        ON shard.work_kind = work.work_kind AND shard.shard_id = work.shard_id
+      WHERE work.id = '${WORK}'`);
+    expect(proof.rows).toEqual([
+      {
+        work_id: WORK,
+        max_id: WORK,
+        cursor_id: WORK,
+        work_shard: 32,
+        proof_pass: 0,
+        effective_priority: 0,
+      },
+    ]);
+    const functionAuthority = await db.query<{ volatility: string; parallel: string }>(`
+      SELECT provolatile::text AS volatility, proparallel::text AS parallel
+      FROM pg_proc WHERE proname = 'agent_backup_admission_effective_priority'
+    `);
+    expect(functionAuthority.rows).toEqual([{ volatility: "i", parallel: "s" }]);
+  });
+
+  test("rejects future readiness and a fresh base-three item at pass zero", async () => {
+    const futureDb = await database();
+    const FUTURE_WORK = "80000000-0000-4000-8000-000000000042";
+    const futureClock = await futureDb.query<{
+      due: string;
+      deadline: string;
+      not_before: string;
+    }>(`SELECT (statement_timestamp() - interval '1 hour')::text AS due,
+        (statement_timestamp() - interval '45 minutes')::text AS deadline,
+        (statement_timestamp() + interval '1 hour')::text AS not_before`);
+    const futureTiming = futureClock.rows[0];
+    if (!futureTiming) throw new Error("future readiness fixture is missing");
+    await insertSchedule(futureDb, FUTURE_WORK, ORG_A, SANDBOX_A, HISTORY_A, {
+      sourceDue: futureTiming.due,
+      rpoDeadline: futureTiming.deadline,
+      notBefore: futureTiming.not_before,
+    });
+    await startScheduleClaimCycle(futureDb, {
+      maxCohort: 1,
+      maxOrdinal: 0,
+      maxId: FUTURE_WORK,
+    });
+    await expect(
+      futureDb.exec(`UPDATE agent_backup_admission_work
+        SET state = 'leased', lease_owner = 'future-work',
+          lease_generation = '93000000-0000-4000-8000-000000000042',
+          lease_expires_at = statement_timestamp() + interval '2 hours',
+          attempts = attempts + 1 WHERE id = '${FUTURE_WORK}'`),
+    ).rejects.toThrow(/claim requires ready work/i);
+
+    const freshDb = await database();
+    const FRESH_WORK = "80000000-0000-4000-8000-000000000043";
+    const freshClock = await freshDb.query<{ due: string; deadline: string }>(`
+      SELECT statement_timestamp()::text AS due,
+        (statement_timestamp() + interval '15 minutes')::text AS deadline
+    `);
+    const freshTiming = freshClock.rows[0];
+    if (!freshTiming) throw new Error("fresh priority fixture is missing");
+    await insertSchedule(freshDb, FRESH_WORK, ORG_A, SANDBOX_A, HISTORY_A, {
+      sourceDue: freshTiming.due,
+      rpoDeadline: freshTiming.deadline,
+      notBefore: freshTiming.due,
+    });
+    await startScheduleClaimCycle(freshDb, {
+      maxCohort: 1,
+      maxOrdinal: 0,
+      maxId: FRESH_WORK,
+    });
+    const freshEligibility = await freshDb.query<{
+      base_priority: number;
+      age_ms: number;
+      effective_priority: number;
+    }>(`SELECT work.base_priority,
+        EXTRACT(EPOCH FROM (shard.cycle_observed_at - work.first_eligible_at)) * 1000
+          AS age_ms,
+        agent_backup_admission_effective_priority(work.base_priority,
+          work.first_eligible_at, shard.cycle_observed_at,
+          shard.cycle_aging_interval_ms) AS effective_priority
+      FROM agent_backup_admission_work work
+      JOIN agent_backup_admission_claim_shards shard
+        ON shard.work_kind = work.work_kind AND shard.shard_id = work.shard_id
+      WHERE work.id = '${FRESH_WORK}'`);
+    expect(freshEligibility.rows[0]).toMatchObject({ base_priority: 3, effective_priority: 3 });
+    await expect(
+      freshDb.exec(`UPDATE agent_backup_admission_work
+        SET state = 'leased', lease_owner = 'wrong-pass',
+          lease_generation = '93000000-0000-4000-8000-000000000043',
+          lease_expires_at = statement_timestamp() + interval '1 hour',
+          attempts = attempts + 1 WHERE id = '${FRESH_WORK}'`),
+    ).rejects.toThrow(/exact effective priority pass/i);
+    const rolledBack = await freshDb.query<{
+      state: string;
+      attempts: number;
+      proof: string | null;
+    }>(`SELECT state, attempts, claim_proof_turn::text AS proof
+      FROM agent_backup_admission_work WHERE id = '${FRESH_WORK}'`);
+    expect(rolledBack.rows).toEqual([{ state: "queued", attempts: 0, proof: null }]);
   });
 
   test("enforces monotonic claim turns, frozen cycles, and complete priority passes", async () => {
@@ -600,20 +825,11 @@ describe("backup admission cohort migrations", () => {
           last_admitted_work_id = '1f000000-0000-4000-8000-000000000001'
         WHERE work_kind = 'schedule_capture' AND shard_id = 31`),
     ).rejects.toThrow(/start at its first pass/i);
-    await expect(
-      db.exec(`UPDATE agent_backup_admission_claim_shards
-        SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
-          cycle_observed_at = clock_timestamp(), cycle_max_cohort = 42,
-          cycle_max_ordinal = 99,
-          cycle_max_id = '21000000-0000-4fff-bfff-ffffffffffff',
-          cycle_aging_interval_ms = 900000, priority_pass = 0
-        WHERE work_kind = 'schedule_capture' AND shard_id = 32`),
-    ).rejects.toThrow(/bounds must belong to their shard/i);
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
-        cycle_observed_at = clock_timestamp(), cycle_max_cohort = 42,
+        cycle_observed_at = '2000-01-01 00:00:00+00', cycle_max_cohort = 42,
         cycle_max_ordinal = 99,
-        cycle_max_id = '20000000-0000-4fff-bfff-ffffffffffff',
+        cycle_max_id = '80000000-0000-4fff-bfff-ffffffffffff',
         cycle_aging_interval_ms = 900000, priority_pass = 0
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
     await expect(
@@ -625,13 +841,13 @@ describe("backup admission cohort migrations", () => {
       db.exec(`UPDATE agent_backup_admission_claim_shards
         SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
           scan_cursor_cohort = 42, scan_cursor_ordinal = 100,
-          scan_cursor_id = '20000000-0000-4000-8000-000000000001'
+          scan_cursor_id = '80000000-0000-4000-8000-000000000001'
         WHERE work_kind = 'schedule_capture' AND shard_id = 32`),
     ).rejects.toThrow(/cycle_shape_check/i);
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         scan_cursor_cohort = 10, scan_cursor_ordinal = 2,
-        scan_cursor_id = '20000000-0000-4000-8000-000000000001'
+        scan_cursor_id = '80000000-0000-4000-8000-000000000001'
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
     await expect(
       db.exec(`UPDATE agent_backup_admission_claim_shards
@@ -693,7 +909,7 @@ describe("backup admission cohort migrations", () => {
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         cycle_observed_at = clock_timestamp(), cycle_max_cohort = 1,
-        cycle_max_ordinal = 0, cycle_max_id = '00000000-0000-4fff-bfff-ffffffffffff',
+        cycle_max_ordinal = 0, cycle_max_id = '80000000-0000-4fff-bfff-ffffffffffff',
         cycle_aging_interval_ms = 900000, priority_pass = 0
       WHERE work_kind = 'gc_object' AND shard_id = 0`);
     await expect(db.exec(`TRUNCATE agent_backup_admission_claim_shards`)).rejects.toThrow(
@@ -709,7 +925,7 @@ describe("backup admission cohort migrations", () => {
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         scan_cursor_cohort = 1, scan_cursor_ordinal = 0,
-        scan_cursor_id = '20000000-0000-4000-8000-000000000001'
+        scan_cursor_id = '${WORK}'
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
 
     await db.exec(`UPDATE agent_backup_admission_work
@@ -824,7 +1040,7 @@ describe("backup admission cohort migrations", () => {
     await db.exec(`UPDATE agent_backup_admission_claim_shards
       SET last_turn = nextval('agent_backup_admission_claim_turn_seq'),
         scan_cursor_cohort = 2, scan_cursor_ordinal = 0,
-        scan_cursor_id = '20000000-0000-4000-8000-000000000001'
+        scan_cursor_id = '${WORK}'
       WHERE work_kind = 'schedule_capture' AND shard_id = 32`);
     await db.exec(`UPDATE agent_backup_admission_work
       SET state = 'queued', lease_owner = NULL, lease_generation = NULL,
@@ -856,7 +1072,9 @@ describe("backup admission cohort migrations", () => {
     ).rejects.toThrow();
     await insertSchedule(db, WORK_B, ORG_A, SANDBOX_B, HISTORY_B);
     await insertSchedule(db, WORK_C, ORG_B, SANDBOX_C, HISTORY_A);
-    await insertSchedule(db, "80000000-0000-4000-8000-000000000005", ORG_A, SANDBOX_A, HISTORY_B);
+    await expect(
+      insertSchedule(db, "80000000-0000-4000-8000-000000000005", ORG_A, SANDBOX_A, HISTORY_B),
+    ).rejects.toThrow(/unsettled_schedule_uidx/i);
 
     await expect(
       db.exec(`UPDATE agent_backup_admission_work
@@ -936,6 +1154,7 @@ describe("backup admission cohort migrations", () => {
       db.exec(`UPDATE agent_backup_admission_work SET updated_at = clock_timestamp()
         WHERE id = '${WORK_A}'`),
     ).rejects.toThrow(/settled.*immutable/i);
+    await insertSchedule(db, "80000000-0000-4000-8000-000000000005", ORG_A, SANDBOX_A, HISTORY_B);
   });
 
   test("rejects forged inserts, cross-tenant work, replay, and authority removal", async () => {
