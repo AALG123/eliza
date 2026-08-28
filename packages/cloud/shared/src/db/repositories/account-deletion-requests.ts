@@ -79,25 +79,34 @@ async function settleBackupAdmissionForDeletion(
  * request before any existing export or phase row. Organization-scoped
  * lifecycle transitions take their organization/member locks first.
  */
-async function lockAccountDeletionRequest(tx: DbTransaction, requestId: string): Promise<boolean> {
+async function lockAccountDeletionRequest(
+  tx: DbTransaction,
+  requestId: string,
+): Promise<Pick<AccountDeletionRequest, "id" | "status"> | undefined> {
   const [request] = await tx
-    .select({ id: accountDeletionRequests.id })
+    .select({ id: accountDeletionRequests.id, status: accountDeletionRequests.status })
     .from(accountDeletionRequests)
     .where(eq(accountDeletionRequests.id, requestId))
     .for("update")
     .limit(1);
-  return request !== undefined;
+  return request;
 }
 
 /** Existing export rows precede any contended phase-row lock or mutation. */
-async function lockAccountDeletionExport(tx: DbTransaction, requestId: string): Promise<boolean> {
+async function lockAccountDeletionExport(
+  tx: DbTransaction,
+  requestId: string,
+): Promise<Pick<AccountDeletionExport, "request_id" | "status"> | undefined> {
   const [exportReceipt] = await tx
-    .select({ requestId: accountDeletionExports.request_id })
+    .select({
+      request_id: accountDeletionExports.request_id,
+      status: accountDeletionExports.status,
+    })
     .from(accountDeletionExports)
     .where(eq(accountDeletionExports.request_id, requestId))
     .for("update")
     .limit(1);
-  return exportReceipt !== undefined;
+  return exportReceipt;
 }
 
 export interface ReservePersonalAccountDeletionInput {
@@ -1937,10 +1946,22 @@ export class AccountDeletionRequestsRepository {
       // The phase INSERT below acquires a request FK lock. Take the stronger
       // request row lock before export mutation so this helper cannot cycle
       // with expiry or terminal finalizers that follow request -> export.
-      // Deliberately continue when the row is absent so the phase INSERT keeps
-      // the existing foreign-key failure contract.
-      await lockAccountDeletionRequest(tx, input.requestId);
-      await tx
+      const request = await lockAccountDeletionRequest(tx, input.requestId);
+      if (!request || request.status === "completed" || request.status === "canceled") return;
+
+      // A stale catalogue read may arrive after an earlier revocation or after
+      // terminal erasure. Never recreate work for a deleted export, and fail
+      // closed if a non-terminal request has lost its durable export receipt.
+      const exportReceipt = await lockAccountDeletionExport(tx, input.requestId);
+      if (!exportReceipt) {
+        throw new ElizaError("Deletion export receipt disappeared before revocation scheduling", {
+          code: "ACCOUNT_DELETION_EXPORT_REVOCATION_RECEIPT_MISSING",
+          severity: "fatal",
+        });
+      }
+      if (exportReceipt.status === "deleted") return;
+
+      const [expired] = await tx
         .update(accountDeletionExports)
         .set({ status: "expired", updated_at: input.now })
         .where(
@@ -1948,7 +1969,14 @@ export class AccountDeletionRequestsRepository {
             eq(accountDeletionExports.request_id, input.requestId),
             notInArray(accountDeletionExports.status, ["deleted"]),
           ),
-        );
+        )
+        .returning({ id: accountDeletionExports.id });
+      if (!expired) {
+        throw new ElizaError("Deletion export receipt disappeared before revocation scheduling", {
+          code: "ACCOUNT_DELETION_EXPORT_REVOCATION_RECEIPT_MISSING",
+          severity: "fatal",
+        });
+      }
       await tx
         .insert(accountDeletionPhaseReceipts)
         .values({

@@ -194,7 +194,7 @@ describe("account deletion global lock order", () => {
     expectFirstAccessIs("finalizeCancellationIfComplete", PHASE_ACCESS, SORTED_PHASES_LOCK);
     expectOrdered("ensureExportRevocationPhase", [REQUEST_ACCESS, EXPORT_ACCESS, PHASE_ACCESS]);
     expectFirstAccessIs("ensureExportRevocationPhase", REQUEST_ACCESS, REQUEST_LOCK_HELPER);
-    expectFirstAccessIs("ensureExportRevocationPhase", EXPORT_ACCESS, EXPORT_MUTATION);
+    expectFirstAccessIs("ensureExportRevocationPhase", EXPORT_ACCESS, EXPORT_LOCK_HELPER);
   });
 
   test("phase completion helpers never take a child row before its parents", () => {

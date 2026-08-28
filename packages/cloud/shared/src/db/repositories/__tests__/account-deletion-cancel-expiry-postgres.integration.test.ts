@@ -64,11 +64,12 @@ const ORIGINAL_ENV = {
 
 type Repository = typeof import("../account-deletion-requests").accountDeletionRequestsRepository;
 
-let postgres: EphemeralPostgres | null = await acquireEphemeralPostgres();
+let postgres: EphemeralPostgres | null = null;
 let databaseName: string | null = null;
 let isolatedDsn: string | null = null;
 let control: Client | null = null;
 let repository: Repository | undefined;
+let cleanupPromise: Promise<void> | null = null;
 let closeDatabaseConnectionsForTests:
   | typeof import("../../client").closeDatabaseConnectionsForTests
   | undefined;
@@ -278,12 +279,73 @@ async function applyBillingCancelMigrations(client: Client): Promise<void> {
   }
 }
 
-if (!postgres) {
-  if (REQUIRE_REAL_POSTGRES) {
-    throw new Error("Real PostgreSQL is required for account deletion lock tests");
+async function cleanupHarnessOnce(): Promise<void> {
+  const acquiredPostgres = postgres;
+  const isolatedDatabaseName = databaseName;
+  const activeControl = control;
+  let firstError: unknown;
+  const capture = async (operation: () => Promise<void>): Promise<void> => {
+    try {
+      await operation();
+    } catch (error) {
+      // error-policy:J6 Teardown continues so one cleanup failure cannot leak
+      // the isolated database or its optional ephemeral container.
+      firstError ??= error;
+    }
+  };
+
+  await capture(async () => closeDatabaseConnectionsForTests?.());
+  closeDatabaseConnectionsForTests = undefined;
+  repository = undefined;
+  control = null;
+  await capture(async () => activeControl?.end());
+
+  if (acquiredPostgres && isolatedDatabaseName) {
+    let admin: Client | undefined;
+    await capture(async () => {
+      admin = new Client({ connectionString: acquiredPostgres.dsn });
+      await admin.connect();
+    });
+    if (admin) {
+      await capture(async () => {
+        await admin?.query(
+          "SELECT pg_terminate_backend(pid) FROM pg_stat_activity " +
+            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+          [isolatedDatabaseName],
+        );
+      });
+      await capture(async () => {
+        await admin?.query(`DROP DATABASE IF EXISTS "${isolatedDatabaseName}"`);
+      });
+      await capture(async () => admin?.end());
+    }
   }
-  console.warn(SKIP_REASON);
-} else {
+  await capture(async () => acquiredPostgres?.stop());
+
+  postgres = null;
+  databaseName = null;
+  isolatedDsn = null;
+  for (const [name, value] of Object.entries(ORIGINAL_ENV)) {
+    restoreEnv(name as keyof typeof ORIGINAL_ENV, value);
+  }
+  if (firstError) throw firstError;
+}
+
+function cleanupHarness(): Promise<void> {
+  cleanupPromise ??= cleanupHarnessOnce();
+  return cleanupPromise;
+}
+
+async function initializeHarness(): Promise<void> {
+  postgres = await acquireEphemeralPostgres();
+  if (!postgres) {
+    if (REQUIRE_REAL_POSTGRES) {
+      throw new Error("Real PostgreSQL is required for account deletion lock tests");
+    }
+    console.warn(SKIP_REASON);
+    return;
+  }
+
   isolatedDsn = await createIsolatedDatabase(postgres.dsn);
   process.env.DATABASE_URL = isolatedDsn;
   process.env.TEST_DATABASE_URL = isolatedDsn;
@@ -311,6 +373,21 @@ if (!postgres) {
     clientModule.dbWrite as never,
   );
   await apply();
+}
+
+try {
+  await initializeHarness();
+} catch (initializationError) {
+  try {
+    await cleanupHarness();
+  } catch (cleanupError) {
+    throw new AggregateError(
+      [initializationError, cleanupError],
+      "Account deletion RealPG initialization and cleanup both failed",
+      { cause: initializationError },
+    );
+  }
+  throw initializationError;
 }
 
 beforeAll(async () => {
@@ -413,28 +490,7 @@ beforeAll(async () => {
 }, TEST_TIMEOUT);
 
 afterAll(async () => {
-  await closeDatabaseConnectionsForTests?.();
-  await control?.end();
-  control = null;
-  if (postgres && databaseName) {
-    const admin = new Client({ connectionString: postgres.dsn });
-    await admin.connect();
-    try {
-      await admin.query(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity " +
-          "WHERE datname = $1 AND pid <> pg_backend_pid()",
-        [databaseName],
-      );
-      await admin.query(`DROP DATABASE IF EXISTS "${databaseName}"`);
-    } finally {
-      await admin.end();
-    }
-  }
-  await postgres?.stop();
-  postgres = null;
-  for (const [name, value] of Object.entries(ORIGINAL_ENV)) {
-    restoreEnv(name as keyof typeof ORIGINAL_ENV, value);
-  }
+  await cleanupHarness();
 }, TEST_TIMEOUT);
 
 async function seedRace(ordinal: number): Promise<{
@@ -1212,6 +1268,90 @@ realPostgres("account deletion cancellation/expiry PostgreSQL authority race", (
           },
         ]).toContainEqual(authority.rows[0]);
       }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "does not recreate revocation work from a stale candidate after terminal erasure",
+    async () => {
+      if (!repository || !control) throw new Error("real PostgreSQL harness was not initialized");
+      const seeded = await seedFinalizationRace(40_000);
+      const staleCandidate = (
+        await repository.findExpiredExportCandidates(new Date("2030-01-16T12:00:00.000Z"), 100)
+      ).find((candidate) => candidate.requestId === seeded.requestId);
+      expect(staleCandidate).toBeDefined();
+      if (!staleCandidate) throw new Error("expired export candidate is unavailable");
+
+      const completed = await repository.finalizePersonalAccountDeletion({
+        requestId: seeded.requestId,
+        phaseReceiptId: seeded.phaseReceiptId,
+        generation: 1,
+        completionReceiptDigest: "stale-export-candidate-terminal-erasure",
+        now: new Date("2030-01-16T12:00:01.000Z"),
+      });
+      expect(completed.outcome).toBe("completed");
+
+      await repository.ensureExportRevocationPhase({
+        requestId: staleCandidate.requestId,
+        idempotencyKeyDigest: "stale-export-candidate-must-not-recreate-work",
+        nextAttemptAt: new Date("2030-01-16T12:00:02.000Z"),
+        now: new Date("2030-01-16T12:00:02.000Z"),
+      });
+
+      const authority = await control.query<{
+        exports: string;
+        phases: string;
+        request_status: string;
+      }>(
+        `SELECT request.status AS request_status,
+           (SELECT count(*)::text FROM account_deletion_exports
+              WHERE request_id = request.id) AS exports,
+           (SELECT count(*)::text FROM account_deletion_phase_receipts
+              WHERE request_id = request.id) AS phases
+         FROM account_deletion_requests AS request WHERE request.id = $1`,
+        [seeded.requestId],
+      );
+      expect(authority.rows).toEqual([{ exports: "0", phases: "0", request_status: "completed" }]);
+      expect(
+        (await repository.findExportRevocationsDue(new Date("2030-01-17T12:00:00.000Z"), 100)).some(
+          (candidate) => candidate.requestId === seeded.requestId,
+        ),
+      ).toBe(false);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "fails closed before scheduling when an active request loses its export receipt",
+    async () => {
+      if (!repository || !control) throw new Error("real PostgreSQL harness was not initialized");
+      const seeded = await seedRace(45_000);
+      await control.query("DELETE FROM account_deletion_exports WHERE request_id = $1", [
+        seeded.requestId,
+      ]);
+
+      const scheduled = await reflect(
+        repository.ensureExportRevocationPhase({
+          requestId: seeded.requestId,
+          idempotencyKeyDigest: "missing-export-must-fail-closed",
+          nextAttemptAt: new Date("2030-01-16T12:00:00.000Z"),
+          now: new Date("2030-01-16T12:00:00.000Z"),
+        }),
+      );
+      expect(scheduled.status).toBe("rejected");
+      if (scheduled.status !== "rejected") {
+        throw new Error("missing export unexpectedly scheduled revocation work");
+      }
+      expect(postgresErrorCode(scheduled.reason)).toBe(
+        "ACCOUNT_DELETION_EXPORT_REVOCATION_RECEIPT_MISSING",
+      );
+      const phases = await control.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM account_deletion_phase_receipts
+         WHERE request_id = $1 AND phase = 'export_revoke'`,
+        [seeded.requestId],
+      );
+      expect(phases.rows).toEqual([{ count: "0" }]);
     },
     TEST_TIMEOUT,
   );
