@@ -551,13 +551,16 @@ function writeSessionCachedProviders(providers: StewardProviders): void {
 }
 
 function loadStewardProviders(auth: {
-  getProviders: () => Promise<StewardProviders>;
+  getProviders: (forceRefresh?: boolean) => Promise<StewardProviders>;
 }): Promise<StewardProviders> {
   // Do not short-circuit from cachedStewardProviders here. The cache may seed
   // first paint, but only live discovery may authorize wallet provider mounts
-  // and their persisted-session auto-reconnect behavior.
+  // and their persisted-session auto-reconnect behavior. The SDK also caches
+  // this endpoint for five minutes, so force the transport request: treating
+  // that cache hit as "live" could re-authorize a provider revoked while this
+  // document was suspended in BFCache.
   const requestGeneration = stewardProvidersRequestGeneration;
-  stewardProvidersPromise ??= auth.getProviders().then(
+  stewardProvidersPromise ??= auth.getProviders(true).then(
     (loadedProviders) => {
       // error-policy:J3 SDK response data is an untrusted transport boundary.
       // Reject malformed 200 responses instead of caching or rendering a
@@ -586,7 +589,7 @@ function loadStewardProviders(auth: {
 }
 
 function loadStewardProvidersWithTimeout(auth: {
-  getProviders: () => Promise<StewardProviders>;
+  getProviders: (forceRefresh?: boolean) => Promise<StewardProviders>;
 }): Promise<StewardProviders> {
   return new Promise((resolve, reject) => {
     const timeoutId = window.setTimeout(() => {

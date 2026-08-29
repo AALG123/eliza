@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const walletHooks = vi.hoisted(() => ({
   connectAsync: vi.fn(),
   connectors: [] as Array<{
+    getAccounts?: () => Promise<readonly `0x${string}`[]>;
+    getChainId?: () => Promise<number>;
     getProvider: () => Promise<unknown>;
     id: string;
     name: string;
@@ -25,6 +27,16 @@ const walletHooks = vi.hoisted(() => ({
   connectModalOpen: false,
   evmAccount: {
     address: undefined as `0x${string}` | undefined,
+    connector: undefined as
+      | {
+          getAccounts: () => Promise<readonly `0x${string}`[]>;
+          getChainId: () => Promise<number>;
+          getProvider: () => Promise<unknown>;
+          id: string;
+          name: string;
+          type: string;
+        }
+      | undefined,
     isConnected: false,
     isConnecting: false,
   },
@@ -87,6 +99,7 @@ function resetWalletHooks() {
   walletHooks.connectModalAvailable = true;
   walletHooks.connectModalOpen = false;
   walletHooks.evmAccount.address = undefined;
+  walletHooks.evmAccount.connector = undefined;
   walletHooks.evmAccount.isConnected = false;
   walletHooks.evmAccount.isConnecting = false;
   walletHooks.solanaModalVisible = false;
@@ -105,6 +118,17 @@ function createDeferred<T>() {
     reject = rejectPromise;
   });
   return { promise, reject, resolve };
+}
+
+function createEvmConnector(address: `0x${string}`, chainId: number) {
+  return {
+    getAccounts: vi.fn().mockResolvedValue([address]),
+    getChainId: vi.fn().mockResolvedValue(chainId),
+    getProvider: vi.fn().mockResolvedValue({}),
+    id: "injected",
+    name: "Injected",
+    type: "injected",
+  };
 }
 
 function renderWalletButtons({
@@ -199,6 +223,194 @@ describe("WalletButtons capability gating", () => {
       ).toBe(siws);
     },
   );
+});
+
+describe("WalletButtons SIWE authority binding", () => {
+  beforeEach(resetWalletHooks);
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    Reflect.deleteProperty(window, "ethereum");
+  });
+
+  it.each([
+    { chainId: 8453, name: "Base" },
+    { chainId: 56, name: "BSC" },
+  ])(
+    "passes the live $name chain to Steward and rechecks it before signing",
+    async ({ chainId }) => {
+      const address = "0x1111111111111111111111111111111111111111";
+      const connector = createEvmConnector(address, chainId);
+      walletHooks.evmAccount.address = address;
+      walletHooks.evmAccount.connector = connector;
+      walletHooks.evmAccount.isConnected = true;
+      walletHooks.signMessageAsync.mockResolvedValue("0xsigned");
+      const signInWithSIWE = vi.fn(
+        async (
+          _address: string,
+          signer: (message: string) => Promise<string>,
+        ) => {
+          await signer("chain-bound SIWE message");
+          return {};
+        },
+      );
+      const { props } = renderWalletButtons({
+        authOverride: { signInWithSIWE } as unknown as StewardAuth,
+        siwe: true,
+      });
+
+      fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+      await waitFor(() => expect(props.onSuccess).toHaveBeenCalledTimes(1));
+      expect(signInWithSIWE).toHaveBeenCalledWith(
+        address,
+        expect.any(Function),
+        chainId,
+      );
+      expect(connector.getAccounts).toHaveBeenCalledTimes(2);
+      expect(connector.getChainId).toHaveBeenCalledTimes(2);
+      expect(walletHooks.signMessageAsync).toHaveBeenCalledWith({
+        message: "chain-bound SIWE message",
+      });
+    },
+  );
+
+  it("fails before nonce/signature work on an unsupported connected chain", async () => {
+    const address = "0x2222222222222222222222222222222222222222";
+    walletHooks.evmAccount.address = address;
+    walletHooks.evmAccount.connector = createEvmConnector(address, 1);
+    walletHooks.evmAccount.isConnected = true;
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message:
+        "Ethereum wallet sign-in requires a supported chain (8453, 56), but the wallet is on chain 1.",
+    });
+    expect(signInWithSIWE).not.toHaveBeenCalled();
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+  });
+
+  it("rejects a supported chain switch between nonce and signature", async () => {
+    const address = "0x3333333333333333333333333333333333333333";
+    const connector = createEvmConnector(address, 8453);
+    connector.getChainId
+      .mockReset()
+      .mockResolvedValueOnce(8453)
+      .mockResolvedValueOnce(56);
+    walletHooks.evmAccount.address = address;
+    walletHooks.evmAccount.connector = connector;
+    walletHooks.evmAccount.isConnected = true;
+    const signInWithSIWE = vi.fn(
+      async (
+        _address: string,
+        signer: (message: string) => Promise<string>,
+      ) => {
+        await signer("stale-chain SIWE message");
+        return {};
+      },
+    );
+    const { props } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(signInWithSIWE).toHaveBeenCalledWith(
+      address,
+      expect.any(Function),
+      8453,
+    );
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: "Ethereum wallet chain changed from 8453 to 56 before signing.",
+    });
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+  });
+
+  it("rejects an account switch between nonce and signature", async () => {
+    const address = "0x4444444444444444444444444444444444444444";
+    const connector = createEvmConnector(address, 8453);
+    connector.getAccounts
+      .mockReset()
+      .mockResolvedValueOnce([address])
+      .mockResolvedValueOnce(["0x5555555555555555555555555555555555555555"]);
+    walletHooks.evmAccount.address = address;
+    walletHooks.evmAccount.connector = connector;
+    walletHooks.evmAccount.isConnected = true;
+    const signInWithSIWE = vi.fn(
+      async (
+        _address: string,
+        signer: (message: string) => Promise<string>,
+      ) => {
+        await signer("stale-account SIWE message");
+        return {};
+      },
+    );
+    const { props } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message:
+        "Ethereum wallet account changed before sign-in could be authorized.",
+    });
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+  });
+
+  it("binds and rechecks the chain for the direct EIP-1193 path", async () => {
+    const address = "0x6666666666666666666666666666666666666666";
+    const request = vi.fn(async ({ method }: { method: string }) => {
+      if (method === "eth_accounts") return [address];
+      if (method === "eth_chainId") return "0x2105";
+      if (method === "personal_sign") return "0xsigned";
+      throw new Error(`Unexpected wallet method: ${method}`);
+    });
+    Object.defineProperty(window, "ethereum", {
+      configurable: true,
+      value: { request },
+    });
+    const signInWithSIWE = vi.fn(
+      async (
+        _address: string,
+        signer: (message: string) => Promise<string>,
+      ) => {
+        await signer("direct-provider SIWE message");
+        return {};
+      },
+    );
+    const { props } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onSuccess).toHaveBeenCalledTimes(1));
+    expect(signInWithSIWE).toHaveBeenCalledWith(
+      address,
+      expect.any(Function),
+      8453,
+    );
+    expect(
+      request.mock.calls.filter(([args]) => args.method === "eth_chainId"),
+    ).toHaveLength(2);
+    expect(
+      request.mock.calls.filter(([args]) => args.method === "personal_sign"),
+    ).toHaveLength(1);
+  });
 });
 
 describe("WalletButtons modal intent lifecycle", () => {
@@ -340,6 +552,10 @@ describe("WalletButtons modal intent lifecycle", () => {
     walletHooks.evmAccount.isConnected = true;
     walletHooks.evmAccount.address =
       "0x2222222222222222222222222222222222222222";
+    walletHooks.evmAccount.connector = createEvmConnector(
+      "0x2222222222222222222222222222222222222222",
+      8453,
+    );
     rerenderWalletButtons();
 
     await waitFor(() => expect(signInWithSIWE).toHaveBeenCalledTimes(1));
@@ -603,6 +819,10 @@ describe("WalletButtons deferred intent liveness", () => {
   it("blocks a deferred SIWE signer callback and completion after unmount", async () => {
     walletHooks.evmAccount.address =
       "0x8888888888888888888888888888888888888888";
+    walletHooks.evmAccount.connector = createEvmConnector(
+      "0x8888888888888888888888888888888888888888",
+      8453,
+    );
     walletHooks.evmAccount.isConnected = true;
     const sdkResult = createDeferred<Record<string, never>>();
     let sdkSigner: ((message: string) => Promise<string>) | undefined;

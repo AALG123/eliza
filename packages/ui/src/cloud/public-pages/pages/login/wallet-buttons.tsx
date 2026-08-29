@@ -32,6 +32,10 @@ import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { type Connector, useAccount, useConnect, useSignMessage } from "wagmi";
 import { Button } from "../../../../components/ui/button";
 import { Spinner } from "../../../../components/ui/spinner";
+import {
+  isSupportedLoginChainId,
+  SUPPORTED_SIWE_LOGIN_CHAIN_IDS,
+} from "../../../../state/cloud-siwe-login";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
 
 type HexAddress = `0x${string}`;
@@ -39,12 +43,14 @@ type HexAddress = `0x${string}`;
 interface Eip1193Provider {
   isPhantom?: boolean;
   request(args: {
-    method: "eth_accounts" | "eth_requestAccounts";
-  }): Promise<readonly string[] | null>;
-  request(args: {
-    method: "personal_sign";
-    params: readonly [`0x${string}`, HexAddress];
-  }): Promise<string>;
+    method: string;
+    params?: readonly unknown[];
+  }): Promise<unknown>;
+}
+
+interface EvmWalletAuthority {
+  address: HexAddress | null;
+  chainId: number | null;
 }
 
 function getWindowEthereumProvider(): Eip1193Provider | null {
@@ -76,14 +82,16 @@ async function requestEip1193Account(
   provider: Eip1193Provider,
   assertIntentCurrent: () => void,
 ): Promise<HexAddress | null> {
-  const existingAccounts = await provider.request({ method: "eth_accounts" });
+  const existingAccounts = (await provider.request({
+    method: "eth_accounts",
+  })) as readonly string[] | null;
   assertIntentCurrent();
   const [existingAccount] = existingAccounts ?? [];
   if (isHexAddress(existingAccount)) return existingAccount;
 
-  const requestedAccounts = await provider.request({
+  const requestedAccounts = (await provider.request({
     method: "eth_requestAccounts",
-  });
+  })) as readonly string[] | null;
   assertIntentCurrent();
   const [requestedAccount] = requestedAccounts ?? [];
   return isHexAddress(requestedAccount) ? requestedAccount : null;
@@ -106,10 +114,79 @@ async function personalSign(
     method: "personal_sign",
     params: [stringToHex(message), address],
   });
-  if (!signature.startsWith("0x")) {
+  if (typeof signature !== "string" || !signature.startsWith("0x")) {
     throw new Error("Wallet returned an invalid Ethereum signature.");
   }
   return signature;
+}
+
+function parseEip1193ChainId(value: unknown): number | null {
+  if (typeof value !== "string" || !/^0x[0-9a-f]+$/i.test(value)) return null;
+  const chainId = Number.parseInt(value.slice(2), 16);
+  return Number.isSafeInteger(chainId) && chainId > 0 ? chainId : null;
+}
+
+async function readEip1193Authority(
+  provider: Eip1193Provider,
+): Promise<EvmWalletAuthority> {
+  try {
+    const accounts = (await provider.request({
+      method: "eth_accounts",
+    })) as readonly string[] | null;
+    const chainId = parseEip1193ChainId(
+      await provider.request({ method: "eth_chainId" }),
+    );
+    const [account] = accounts ?? [];
+    return {
+      address: isHexAddress(account) ? account : null,
+      chainId,
+    };
+  } catch {
+    return { address: null, chainId: null };
+  }
+}
+
+async function readConnectorAuthority(
+  connector: Connector,
+): Promise<EvmWalletAuthority> {
+  try {
+    const accounts = await connector.getAccounts();
+    const chainId = await connector.getChainId();
+    const [account] = accounts;
+    return {
+      address: isHexAddress(account) ? account : null,
+      chainId: Number.isSafeInteger(chainId) && chainId > 0 ? chainId : null,
+    };
+  } catch {
+    return { address: null, chainId: null };
+  }
+}
+
+function requireSupportedEvmAuthority(
+  authority: EvmWalletAuthority,
+  expectedAddress: HexAddress,
+): { address: HexAddress; chainId: number } {
+  if (
+    !authority.address ||
+    authority.address.toLowerCase() !== expectedAddress.toLowerCase()
+  ) {
+    throw new Error(
+      "Ethereum wallet account changed before sign-in could be authorized.",
+    );
+  }
+  if (authority.chainId === null) {
+    throw new Error(
+      "Ethereum wallet chain could not be confirmed before sign-in.",
+    );
+  }
+  if (!isSupportedLoginChainId(authority.chainId)) {
+    throw new Error(
+      `Ethereum wallet sign-in requires a supported chain (${SUPPORTED_SIWE_LOGIN_CHAIN_IDS.join(
+        ", ",
+      )}), but the wallet is on chain ${authority.chainId}.`,
+    );
+  }
+  return { address: authority.address, chainId: authority.chainId };
 }
 
 // Phantom injects itself as an Ethereum provider but must never be used for
@@ -299,7 +376,7 @@ function EthereumButton({
   onLoadingChange: (loading: boolean) => void;
 }) {
   const t = useCloudT();
-  const { address, isConnected, isConnecting } = useAccount();
+  const { address, connector, isConnected, isConnecting } = useAccount();
   const { signMessageAsync } = useSignMessage();
   const { connectAsync, connectors } = useConnect();
   const { connectModalOpen, openConnectModal } = useConnectModal();
@@ -325,19 +402,39 @@ function EthereumButton({
   const signWith = useCallback(
     async (
       addr: HexAddress,
+      readAuthority: () => Promise<EvmWalletAuthority>,
       signMessage: (message: string) => Promise<string>,
       generation: number,
     ) => {
       if (!isIntentCurrent(generation)) return;
       onLoadingChange(true);
       try {
+        const initialAuthority = requireSupportedEvmAuthority(
+          await readAuthority(),
+          addr,
+        );
+        throwIfWalletIntentExpired(isIntentCurrent, generation);
         const result = requireCompletedAuth(
-          await auth.signInWithSIWE(addr, async (message: string) => {
-            throwIfWalletIntentExpired(isIntentCurrent, generation);
-            const signature = await signMessage(message);
-            throwIfWalletIntentExpired(isIntentCurrent, generation);
-            return signature;
-          }),
+          await auth.signInWithSIWE(
+            addr,
+            async (message: string) => {
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              const authorityBeforeSign = requireSupportedEvmAuthority(
+                await readAuthority(),
+                addr,
+              );
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              if (authorityBeforeSign.chainId !== initialAuthority.chainId) {
+                throw new Error(
+                  `Ethereum wallet chain changed from ${initialAuthority.chainId} to ${authorityBeforeSign.chainId} before signing.`,
+                );
+              }
+              const signature = await signMessage(message);
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              return signature;
+            },
+            initialAuthority.chainId,
+          ),
         );
         if (!isIntentCurrent(generation)) return;
         await onSuccess(result);
@@ -363,9 +460,14 @@ function EthereumButton({
   );
 
   const sign = useCallback(
-    async (addr: HexAddress, generation: number) => {
+    async (
+      addr: HexAddress,
+      activeConnector: Connector,
+      generation: number,
+    ) => {
       await signWith(
         addr,
+        async () => await readConnectorAuthority(activeConnector),
         async (message: string) => {
           return await signMessageAsync({ message });
         },
@@ -379,6 +481,7 @@ function EthereumButton({
     async (provider: Eip1193Provider, addr: HexAddress, generation: number) => {
       await signWith(
         addr,
+        async () => await readEip1193Authority(provider),
         async (message: string) => {
           return await personalSign(provider, addr, message);
         },
@@ -392,16 +495,36 @@ function EthereumButton({
   useEffect(() => {
     const generation = pendingSignGenerationRef.current;
     if (
-      pendingSignRef.current &&
-      generation !== null &&
-      isIntentCurrent(generation) &&
-      isConnected &&
-      address
-    ) {
-      clearPendingSignIntent();
-      void sign(address, generation);
+      !pendingSignRef.current ||
+      generation === null ||
+      !isIntentCurrent(generation) ||
+      !isConnected ||
+      !address
+    )
+      return;
+    clearPendingSignIntent();
+    if (!connector) {
+      invalidateSignIntent();
+      onLoadingChange(false);
+      onError(
+        new Error(
+          "Ethereum wallet connection could not be confirmed. Reconnect and try again.",
+        ),
+      );
+      return;
     }
-  }, [isConnected, address, clearPendingSignIntent, isIntentCurrent, sign]);
+    void sign(address, connector, generation);
+  }, [
+    isConnected,
+    address,
+    connector,
+    clearPendingSignIntent,
+    invalidateSignIntent,
+    isIntentCurrent,
+    onError,
+    onLoadingChange,
+    sign,
+  ]);
 
   // RainbowKit exposes the connect modal's lifecycle separately from wagmi's
   // connection state. Once a modal opened for this button closes without a
@@ -477,7 +600,7 @@ function EthereumButton({
             }),
           );
         }
-        await sign(account, generation);
+        await sign(account, connector, generation);
       } catch (e) {
         if (!isIntentCurrent(generation)) return;
         const err = e instanceof Error ? e : new Error(String(e));
@@ -509,7 +632,16 @@ function EthereumButton({
     clearPendingSignIntent();
     const generation = beginIntent();
     if (isConnected && address) {
-      void sign(address, generation);
+      if (!connector) {
+        invalidateSignIntent();
+        onError(
+          new Error(
+            "Ethereum wallet connection could not be confirmed. Reconnect and try again.",
+          ),
+        );
+        return;
+      }
+      void sign(address, connector, generation);
       return;
     }
     void connectAndSign(generation);
@@ -518,9 +650,12 @@ function EthereumButton({
     beginIntent,
     clearPendingSignIntent,
     connectAndSign,
+    connector,
     disabled,
+    invalidateSignIntent,
     isConnected,
     loading,
+    onError,
     sign,
   ]);
 

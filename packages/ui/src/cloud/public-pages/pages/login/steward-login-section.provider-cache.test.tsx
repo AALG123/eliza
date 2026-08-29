@@ -32,7 +32,7 @@ const harness = vi.hoisted(() => {
   const providerDeferreds: Promise<unknown>[] = [];
   const resolveProviders: Array<(value: unknown) => void> = [];
   const rejectProviders: Array<(reason: unknown) => void> = [];
-  for (let index = 0; index < 3; index += 1) {
+  for (let index = 0; index < 5; index += 1) {
     providerDeferreds.push(
       new Promise<unknown>((resolve, reject) => {
         resolveProviders.push(resolve);
@@ -44,9 +44,12 @@ const harness = vi.hoisted(() => {
     hasCallback: false,
     code: null as string | null,
     getProvidersCalls: 0,
+    getProvidersForceRefreshArgs: [] as boolean[],
+    networkProviderCalls: 0,
     providerDeferreds,
     rejectProviders,
     resolveProviders,
+    useSdkLikeCache: false,
   };
 });
 
@@ -63,16 +66,34 @@ vi.mock("../../lib/steward-session", () => ({
 
 vi.mock("@stwd/sdk", () => ({
   StewardAuth: class {
+    private providersCache: { data: unknown; fetchedAt: number } | null = null;
+
     getSession() {
       return null;
     }
-    getProviders() {
-      const deferred = harness.providerDeferreds[harness.getProvidersCalls];
+
+    getProviders(forceRefresh = false) {
       harness.getProvidersCalls += 1;
+      harness.getProvidersForceRefreshArgs.push(forceRefresh);
+      if (
+        harness.useSdkLikeCache &&
+        !forceRefresh &&
+        this.providersCache !== null &&
+        Date.now() - this.providersCache.fetchedAt < 5 * 60 * 1_000
+      ) {
+        return Promise.resolve(this.providersCache.data);
+      }
+      const deferred = harness.providerDeferreds[harness.networkProviderCalls];
+      harness.networkProviderCalls += 1;
       return (
         deferred ??
         Promise.reject(new Error("Unexpected extra provider discovery call"))
-      );
+      ).then((providers) => {
+        if (harness.useSdkLikeCache) {
+          this.providersCache = { data: providers, fetchedAt: Date.now() };
+        }
+        return providers;
+      });
     }
     refreshSession() {
       return Promise.resolve(null);
@@ -164,6 +185,20 @@ const WALLET_ONLY_PROVIDERS = {
   telegram: false,
 };
 
+const REVOKED_PROVIDERS = {
+  passkey: false,
+  email: false,
+  sms: false,
+  siwe: false,
+  siws: false,
+  google: false,
+  discord: false,
+  github: false,
+  telegram: false,
+  twitter: false,
+  oauth: [],
+};
+
 function resolveProviderCall(index: number, value: unknown): void {
   const resolve = harness.resolveProviders[index];
   if (!resolve) throw new Error(`Missing provider resolver ${index}`);
@@ -188,6 +223,7 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
   beforeEach(() => {
     harness.hasCallback = false;
     harness.code = null;
+    harness.useSdkLikeCache = false;
     window.sessionStorage.clear();
   });
 
@@ -381,5 +417,47 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
       await screen.findByRole("button", { name: /EVM wallet/i }),
     ).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Solana wallet/i })).toBeNull();
+  });
+
+  it("bypasses the SDK provider cache when BFCache restores a revoked method", async () => {
+    harness.useSdkLikeCache = true;
+    const firstNetworkCall = harness.networkProviderCalls;
+
+    renderSection("/login");
+    await waitFor(() =>
+      expect(harness.networkProviderCalls).toBe(firstNetworkCall + 1),
+    );
+    expect(harness.getProvidersForceRefreshArgs.at(-1)).toBe(true);
+    resolveProviderCall(firstNetworkCall, CACHED_PROVIDERS);
+
+    const googleButton = (await screen.findByRole("button", {
+      name: /^Google$/i,
+    })) as HTMLButtonElement;
+    expect(googleButton.disabled).toBe(false);
+
+    const callsBeforeRestore = harness.getProvidersCalls;
+    const networksBeforeRestore = harness.networkProviderCalls;
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+
+    // Revocation is synchronous: the old actionable tree is replaced by the
+    // reserved loading frame before discovery can establish new authority.
+    expect(googleButton.isConnected).toBe(false);
+    expect(
+      screen.getByRole("status", { name: "Loading sign-in options" }),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(harness.getProvidersCalls).toBe(callsBeforeRestore + 1),
+    );
+    expect(harness.networkProviderCalls).toBe(networksBeforeRestore + 1);
+    expect(harness.getProvidersForceRefreshArgs.at(-1)).toBe(true);
+
+    resolveProviderCall(networksBeforeRestore, REVOKED_PROVIDERS);
+
+    expect(
+      await screen.findByText("No sign-in methods are available"),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^Google$/i })).toBeNull();
   });
 });
