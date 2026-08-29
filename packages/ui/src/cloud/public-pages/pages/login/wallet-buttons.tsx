@@ -28,7 +28,7 @@ import type {
   StewardAuthResult,
   StewardMfaRequiredResult,
 } from "@stwd/sdk";
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import { type Connector, useAccount, useConnect, useSignMessage } from "wagmi";
 import { Button } from "../../../../components/ui/button";
 import { Spinner } from "../../../../components/ui/spinner";
@@ -74,14 +74,17 @@ function requireCompletedAuth(
 
 async function requestEip1193Account(
   provider: Eip1193Provider,
+  assertIntentCurrent: () => void,
 ): Promise<HexAddress | null> {
   const existingAccounts = await provider.request({ method: "eth_accounts" });
+  assertIntentCurrent();
   const [existingAccount] = existingAccounts ?? [];
   if (isHexAddress(existingAccount)) return existingAccount;
 
   const requestedAccounts = await provider.request({
     method: "eth_requestAccounts",
   });
+  assertIntentCurrent();
   const [requestedAccount] = requestedAccounts ?? [];
   return isHexAddress(requestedAccount) ? requestedAccount : null;
 }
@@ -113,51 +116,112 @@ async function personalSign(
 // SIWE — it is Solana-first and the user's intent for SIWE is a real EVM wallet.
 // We mirror the previous EIP-1193 isPhantom check, but against the connector's
 // underlying provider so the wagmi store stays the source of truth.
-async function isPhantomConnector(connector: Connector): Promise<boolean> {
+function isInjectedStyleConnector(connector: Connector): boolean {
+  const id = connector.id.toLowerCase();
+  const type = connector.type.toLowerCase();
+  return (
+    type === "injected" ||
+    id === "metamask" ||
+    id === "metamasksdk" ||
+    id === "coinbasewallet" ||
+    id === "coinbasewalletsdk"
+  );
+}
+
+async function isEligibleEvmConnector(connector: Connector): Promise<boolean> {
   const id = connector.id.toLowerCase();
   const name = (connector.name ?? "").toLowerCase();
-  if (id.includes("phantom") || name.includes("phantom")) return true;
+  if (id.includes("phantom") || name.includes("phantom")) return false;
   try {
     const provider = (await connector.getProvider()) as unknown;
     if (provider !== null && typeof provider === "object") {
-      if (Reflect.get(provider, "isPhantom") === true) return true;
+      if (Reflect.get(provider, "isPhantom") === true) return false;
     }
+    // Wagmi always registers its injected connector, even when the browser has
+    // no extension. Treat a missing provider as unavailable so RainbowKit can
+    // offer WalletConnect instead of attempting a doomed injected connect.
+    if (isInjectedStyleConnector(connector) && provider == null) return false;
   } catch {
-    // error-policy:J6 best-effort provider probe. A connector that can't
-    // surface its provider yet is treated as non-Phantom; the real failure (if
-    // any) surfaces at the downstream connect() the caller runs regardless.
+    // error-policy:J6 a failed injected provider probe means the extension is
+    // unavailable. Non-injected connectors stay under RainbowKit's modal.
     return false;
   }
-  return false;
+  return true;
 }
 
-// Pick the best EVM connector that is NOT Phantom. Prefer an "injected"-style
-// connector (MetaMask, generic injected, Coinbase, etc.) over WalletConnect so
-// users with a wallet extension get the native popup instead of a QR modal.
+// Pick the best available injected EVM connector that is NOT Phantom. When no
+// extension-backed connector is usable, return null so RainbowKit owns the
+// WalletConnect selection/QR flow rather than connecting one connector blind.
 async function pickInjectedConnector(
   connectors: readonly Connector[],
 ): Promise<Connector | null> {
-  const eligible: Connector[] = [];
   for (const connector of connectors) {
-    if (await isPhantomConnector(connector)) continue;
-    eligible.push(connector);
+    if (!isInjectedStyleConnector(connector)) continue;
+    if (!(await isEligibleEvmConnector(connector))) continue;
+    return connector;
   }
-  if (eligible.length === 0) return null;
+  return null;
+}
 
-  // Prefer injected-type connectors over walletConnect; ordering within
-  // `connectors` already reflects RainbowKit's wallet detection priority.
-  const injected = eligible.find((c) => {
-    const type = c.type.toLowerCase();
-    const id = c.id.toLowerCase();
+/**
+ * Component-local async intent guard. Cleanup marks the lifecycle unavailable
+ * synchronously, but defers final invalidation by one microtask so React
+ * StrictMode's setup → cleanup → setup replay can supersede the cleanup without
+ * abandoning the one auto-started wallet intent.
+ */
+function useWalletIntentLifecycle(onUnmount: () => void) {
+  const mountedRef = useRef(true);
+  const intentGenerationRef = useRef(0);
+  const lifecycleRef = useRef(0);
+  const cleanupPendingRef = useRef<number | null>(null);
+
+  useLayoutEffect(() => {
+    const lifecycle = lifecycleRef.current + 1;
+    lifecycleRef.current = lifecycle;
+    mountedRef.current = true;
+    cleanupPendingRef.current = null;
+    return () => {
+      cleanupPendingRef.current = lifecycle;
+      queueMicrotask(() => {
+        if (
+          lifecycleRef.current === lifecycle &&
+          cleanupPendingRef.current === lifecycle
+        ) {
+          mountedRef.current = false;
+          intentGenerationRef.current += 1;
+          onUnmount();
+        }
+      });
+    };
+  }, [onUnmount]);
+
+  const beginIntent = useCallback(() => {
+    intentGenerationRef.current += 1;
+    return intentGenerationRef.current;
+  }, []);
+
+  const invalidateIntent = useCallback(() => {
+    intentGenerationRef.current += 1;
+  }, []);
+
+  const isIntentCurrent = useCallback((generation: number) => {
     return (
-      type === "injected" ||
-      id === "metamask" ||
-      id === "metaMaskSDK".toLowerCase() ||
-      id === "coinbasewallet" ||
-      id === "coinbasewalletsdk"
+      mountedRef.current &&
+      cleanupPendingRef.current === null &&
+      intentGenerationRef.current === generation
     );
-  });
-  return injected ?? eligible[0];
+  }, []);
+
+  return { beginIntent, invalidateIntent, isIntentCurrent };
+}
+
+function throwIfWalletIntentExpired(
+  isIntentCurrent: (generation: number) => boolean,
+  generation: number,
+) {
+  if (!isIntentCurrent(generation)) {
+    throw new Error("Wallet sign-in intent expired.");
+  }
 }
 
 export function WalletButtons({
@@ -235,117 +299,230 @@ function EthereumButton({
   onLoadingChange: (loading: boolean) => void;
 }) {
   const t = useCloudT();
-  const { address, isConnected } = useAccount();
+  const { address, isConnected, isConnecting } = useAccount();
   const { signMessageAsync } = useSignMessage();
   const { connectAsync, connectors } = useConnect();
-  const { openConnectModal } = useConnectModal();
+  const { connectModalOpen, openConnectModal } = useConnectModal();
   // We start a sign flow either from the click (if already connected) or after
   // the user connects via the modal. This ref tracks the "we're waiting for
   // connection to trigger SIWE" intent.
   const pendingSignRef = useRef(false);
+  const pendingSignGenerationRef = useRef<number | null>(null);
+  const connectModalSeenRef = useRef(false);
+
+  const clearPendingSignIntent = useCallback(() => {
+    pendingSignRef.current = false;
+    pendingSignGenerationRef.current = null;
+    connectModalSeenRef.current = false;
+  }, []);
+  const { beginIntent, invalidateIntent, isIntentCurrent } =
+    useWalletIntentLifecycle(clearPendingSignIntent);
+  const invalidateSignIntent = useCallback(() => {
+    clearPendingSignIntent();
+    invalidateIntent();
+  }, [clearPendingSignIntent, invalidateIntent]);
 
   const signWith = useCallback(
     async (
       addr: HexAddress,
       signMessage: (message: string) => Promise<string>,
+      generation: number,
     ) => {
+      if (!isIntentCurrent(generation)) return;
       onLoadingChange(true);
       try {
         const result = requireCompletedAuth(
-          await auth.signInWithSIWE(addr, signMessage),
+          await auth.signInWithSIWE(addr, async (message: string) => {
+            throwIfWalletIntentExpired(isIntentCurrent, generation);
+            const signature = await signMessage(message);
+            throwIfWalletIntentExpired(isIntentCurrent, generation);
+            return signature;
+          }),
         );
+        if (!isIntentCurrent(generation)) return;
         await onSuccess(result);
       } catch (e) {
+        if (!isIntentCurrent(generation)) return;
         const err = e instanceof Error ? e : new Error(String(e));
         onError(err);
       } finally {
-        onLoadingChange(false);
+        if (isIntentCurrent(generation)) {
+          invalidateSignIntent();
+          onLoadingChange(false);
+        }
       }
     },
-    [auth, onSuccess, onError, onLoadingChange],
+    [
+      auth,
+      invalidateSignIntent,
+      isIntentCurrent,
+      onSuccess,
+      onError,
+      onLoadingChange,
+    ],
   );
 
   const sign = useCallback(
-    async (addr: HexAddress) => {
-      await signWith(addr, async (message: string) => {
-        return await signMessageAsync({ message });
-      });
+    async (addr: HexAddress, generation: number) => {
+      await signWith(
+        addr,
+        async (message: string) => {
+          return await signMessageAsync({ message });
+        },
+        generation,
+      );
     },
     [signMessageAsync, signWith],
   );
 
   const signWithEip1193 = useCallback(
-    async (provider: Eip1193Provider, addr: HexAddress) => {
-      await signWith(addr, async (message: string) => {
-        return await personalSign(provider, addr, message);
-      });
+    async (provider: Eip1193Provider, addr: HexAddress, generation: number) => {
+      await signWith(
+        addr,
+        async (message: string) => {
+          return await personalSign(provider, addr, message);
+        },
+        generation,
+      );
     },
     [signWith],
   );
 
   // If click triggered a connect modal, once connection lands, auto-sign.
   useEffect(() => {
-    if (pendingSignRef.current && isConnected && address) {
-      pendingSignRef.current = false;
-      void sign(address);
+    const generation = pendingSignGenerationRef.current;
+    if (
+      pendingSignRef.current &&
+      generation !== null &&
+      isIntentCurrent(generation) &&
+      isConnected &&
+      address
+    ) {
+      clearPendingSignIntent();
+      void sign(address, generation);
     }
-  }, [isConnected, address, sign]);
+  }, [isConnected, address, clearPendingSignIntent, isIntentCurrent, sign]);
 
-  const connectAndSign = useCallback(async () => {
-    onLoadingChange(true);
-    try {
-      const provider = getWindowEthereumProvider();
-      if (provider) {
-        const account = await requestEip1193Account(provider);
-        if (account) {
-          await signWithEip1193(provider, account);
-          return;
-        }
-      }
-
-      const connector = await pickInjectedConnector(connectors);
-      if (!connector) {
-        // No injected connector available — fall through to the RainbowKit
-        // modal (WalletConnect QR etc.).
-        pendingSignRef.current = true;
-        openConnectModal?.();
-        return;
-      }
-      const { accounts } = await connectAsync({ connector });
-      const [account] = accounts;
-      if (!account) {
-        throw new Error(
-          t("cloud.login.wallet.error.noAccount", {
-            defaultValue: "No Ethereum account returned by wallet.",
-          }),
-        );
-      }
-      await sign(account);
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      onError(err);
-    } finally {
+  // RainbowKit exposes the connect modal's lifecycle separately from wagmi's
+  // connection state. Once a modal opened for this button closes without a
+  // connection still progressing, cancel the pending SIWE intent so an
+  // unrelated future wallet connection cannot trigger a signature prompt.
+  // This intentionally fails closed if the close render wins a race with
+  // wagmi's `isConnecting` update: a later connection requires a fresh click.
+  useLayoutEffect(() => {
+    if (!pendingSignRef.current) return;
+    if (connectModalOpen) {
+      connectModalSeenRef.current = true;
+      return;
+    }
+    if (connectModalSeenRef.current && !isConnected && !isConnecting) {
+      invalidateSignIntent();
       onLoadingChange(false);
     }
   }, [
-    connectAsync,
-    connectors,
-    openConnectModal,
-    onError,
+    connectModalOpen,
+    invalidateSignIntent,
+    isConnected,
+    isConnecting,
     onLoadingChange,
-    sign,
-    signWithEip1193,
-    t,
   ]);
+
+  const connectAndSign = useCallback(
+    async (generation: number) => {
+      onLoadingChange(true);
+      // After a successful modal launch, the modal/connection effects own this
+      // lock until cancellation or a terminal signature result.
+      let modalOwnsLoading = false;
+      try {
+        const provider = getWindowEthereumProvider();
+        if (provider) {
+          const account = await requestEip1193Account(provider, () =>
+            throwIfWalletIntentExpired(isIntentCurrent, generation),
+          );
+          if (!isIntentCurrent(generation)) return;
+          if (account) {
+            await signWithEip1193(provider, account, generation);
+            return;
+          }
+        }
+
+        const connector = await pickInjectedConnector(connectors);
+        if (!isIntentCurrent(generation)) return;
+        if (!connector) {
+          // No injected connector available — fall through to the RainbowKit
+          // modal (WalletConnect QR etc.).
+          if (!openConnectModal) {
+            clearPendingSignIntent();
+            throw new Error(
+              t("cloud.login.wallet.error.connectUnavailable", {
+                defaultValue:
+                  "Ethereum wallet connection is unavailable. Refresh and try again.",
+              }),
+            );
+          }
+          pendingSignRef.current = true;
+          pendingSignGenerationRef.current = generation;
+          connectModalSeenRef.current = false;
+          openConnectModal();
+          modalOwnsLoading = true;
+          return;
+        }
+        const { accounts } = await connectAsync({ connector });
+        if (!isIntentCurrent(generation)) return;
+        const [account] = accounts;
+        if (!account) {
+          throw new Error(
+            t("cloud.login.wallet.error.noAccount", {
+              defaultValue: "No Ethereum account returned by wallet.",
+            }),
+          );
+        }
+        await sign(account, generation);
+      } catch (e) {
+        if (!isIntentCurrent(generation)) return;
+        const err = e instanceof Error ? e : new Error(String(e));
+        onError(err);
+      } finally {
+        if (!modalOwnsLoading && isIntentCurrent(generation)) {
+          invalidateSignIntent();
+          onLoadingChange(false);
+        }
+      }
+    },
+    [
+      clearPendingSignIntent,
+      connectAsync,
+      connectors,
+      invalidateSignIntent,
+      isIntentCurrent,
+      openConnectModal,
+      onError,
+      onLoadingChange,
+      sign,
+      signWithEip1193,
+      t,
+    ],
+  );
 
   const handleClick = useCallback(() => {
     if (disabled || loading) return;
+    clearPendingSignIntent();
+    const generation = beginIntent();
     if (isConnected && address) {
-      void sign(address);
+      void sign(address, generation);
       return;
     }
-    void connectAndSign();
-  }, [disabled, loading, isConnected, address, sign, connectAndSign]);
+    void connectAndSign(generation);
+  }, [
+    address,
+    beginIntent,
+    clearPendingSignIntent,
+    connectAndSign,
+    disabled,
+    isConnected,
+    loading,
+    sign,
+  ]);
 
   const autoStartedRef = useRef(false);
   useEffect(() => {
@@ -354,11 +531,6 @@ function EthereumButton({
     onAutoStartHandled?.();
     handleClick();
   }, [autoStart, disabled, handleClick, loading, onAutoStartHandled]);
-
-  // If the user closes the modal without connecting, we don't have a clean
-  // signal from RainbowKit; the next effect-tick just leaves pendingSignRef
-  // set until the next connect. That's fine — worst case is a stale flag
-  // that fires on a later successful connect.
 
   return (
     <Button
@@ -398,62 +570,159 @@ function SolanaButton({
 }) {
   const t = useCloudT();
   const wallet = useWallet();
-  const { setVisible } = useWalletModal();
+  const { setVisible, visible } = useWalletModal();
   const pendingSignRef = useRef(false);
+  const pendingSignGenerationRef = useRef<number | null>(null);
+  const walletModalSeenRef = useRef(false);
 
-  const sign = useCallback(async () => {
-    if (!wallet.publicKey || !wallet.signMessage) {
-      onError(
-        new Error(
-          t("cloud.login.wallet.error.notSupported", {
-            defaultValue:
-              "Connected Solana wallet does not support message signing.",
+  const clearPendingSignIntent = useCallback(() => {
+    pendingSignRef.current = false;
+    pendingSignGenerationRef.current = null;
+    walletModalSeenRef.current = false;
+  }, []);
+  const { beginIntent, invalidateIntent, isIntentCurrent } =
+    useWalletIntentLifecycle(clearPendingSignIntent);
+  const invalidateSignIntent = useCallback(() => {
+    clearPendingSignIntent();
+    invalidateIntent();
+  }, [clearPendingSignIntent, invalidateIntent]);
+
+  const sign = useCallback(
+    async (generation: number) => {
+      if (!isIntentCurrent(generation)) return;
+      if (!wallet.publicKey || !wallet.signMessage) {
+        invalidateSignIntent();
+        onLoadingChange(false);
+        onError(
+          new Error(
+            t("cloud.login.wallet.error.notSupported", {
+              defaultValue:
+                "Connected Solana wallet does not support message signing.",
+            }),
+          ),
+        );
+        return;
+      }
+      onLoadingChange(true);
+      try {
+        const publicKey = wallet.publicKey.toBase58();
+        const signMessage = wallet.signMessage;
+        const result = requireCompletedAuth(
+          await auth.signInWithSolana(publicKey, async (msg: Uint8Array) => {
+            throwIfWalletIntentExpired(isIntentCurrent, generation);
+            const out = await signMessage(msg);
+            throwIfWalletIntentExpired(isIntentCurrent, generation);
+            if (!out)
+              throw new Error(
+                t("cloud.login.wallet.error.emptySignature", {
+                  defaultValue: "Wallet returned an empty signature.",
+                }),
+              );
+            return out;
           }),
-        ),
-      );
-      return;
-    }
-    onLoadingChange(true);
-    try {
-      const publicKey = wallet.publicKey.toBase58();
-      const signMessage = wallet.signMessage;
-      const result = requireCompletedAuth(
-        await auth.signInWithSolana(publicKey, async (msg: Uint8Array) => {
-          const out = await signMessage(msg);
-          if (!out)
-            throw new Error(
-              t("cloud.login.wallet.error.emptySignature", {
-                defaultValue: "Wallet returned an empty signature.",
-              }),
-            );
-          return out;
-        }),
-      );
-      await onSuccess(result);
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      onError(err);
-    } finally {
-      onLoadingChange(false);
-    }
-  }, [auth, wallet, onSuccess, onError, onLoadingChange, t]);
+        );
+        if (!isIntentCurrent(generation)) return;
+        await onSuccess(result);
+      } catch (e) {
+        if (!isIntentCurrent(generation)) return;
+        const err = e instanceof Error ? e : new Error(String(e));
+        onError(err);
+      } finally {
+        if (isIntentCurrent(generation)) {
+          invalidateSignIntent();
+          onLoadingChange(false);
+        }
+      }
+    },
+    [
+      auth,
+      invalidateSignIntent,
+      isIntentCurrent,
+      wallet,
+      onSuccess,
+      onError,
+      onLoadingChange,
+      t,
+    ],
+  );
 
   useEffect(() => {
-    if (pendingSignRef.current && wallet.connected && wallet.publicKey) {
-      pendingSignRef.current = false;
-      void sign();
+    const generation = pendingSignGenerationRef.current;
+    if (
+      pendingSignRef.current &&
+      generation !== null &&
+      isIntentCurrent(generation) &&
+      wallet.connected &&
+      wallet.publicKey
+    ) {
+      clearPendingSignIntent();
+      void sign(generation);
     }
-  }, [wallet.connected, wallet.publicKey, sign]);
+  }, [
+    wallet.connected,
+    wallet.publicKey,
+    clearPendingSignIntent,
+    isIntentCurrent,
+    sign,
+  ]);
+
+  useLayoutEffect(() => {
+    if (!pendingSignRef.current) return;
+    if (visible) {
+      walletModalSeenRef.current = true;
+      return;
+    }
+    // Fail closed if modal-close renders before `wallet.connecting`: never let
+    // a later connection inherit an intent the user appeared to cancel.
+    if (walletModalSeenRef.current && !wallet.connected && !wallet.connecting) {
+      invalidateSignIntent();
+      onLoadingChange(false);
+    }
+  }, [
+    invalidateSignIntent,
+    onLoadingChange,
+    visible,
+    wallet.connected,
+    wallet.connecting,
+  ]);
 
   const handleClick = useCallback(() => {
     if (disabled || loading) return;
+    clearPendingSignIntent();
+    const generation = beginIntent();
     if (wallet.connected && wallet.publicKey) {
-      void sign();
+      void sign(generation);
       return;
     }
+    // Keep sibling provider actions locked while modal intent can still
+    // progress into a signature. Cancellation and terminal paths release it.
+    onLoadingChange(true);
     pendingSignRef.current = true;
-    setVisible(true);
-  }, [disabled, loading, wallet.connected, wallet.publicKey, sign, setVisible]);
+    pendingSignGenerationRef.current = generation;
+    walletModalSeenRef.current = false;
+    try {
+      setVisible(true);
+    } catch (e) {
+      if (!isIntentCurrent(generation)) return;
+      invalidateSignIntent();
+      onLoadingChange(false);
+      const err = e instanceof Error ? e : new Error(String(e));
+      onError(err);
+    }
+  }, [
+    beginIntent,
+    clearPendingSignIntent,
+    disabled,
+    invalidateSignIntent,
+    isIntentCurrent,
+    loading,
+    onError,
+    onLoadingChange,
+    wallet.connected,
+    wallet.publicKey,
+    sign,
+    setVisible,
+  ]);
 
   const autoStartedRef = useRef(false);
   useEffect(() => {

@@ -108,12 +108,12 @@ export function buildStewardEvmConfig(options: {
 
 export function StewardWalletProviders({
   children,
-  enableEvm = true,
-  enableSolana = true,
+  enableEvm,
+  enableSolana,
 }: {
   children: ReactNode;
-  enableEvm?: boolean;
-  enableSolana?: boolean;
+  enableEvm: boolean;
+  enableSolana: boolean;
 }) {
   const appUrl =
     process.env.NEXT_PUBLIC_APP_URL ??

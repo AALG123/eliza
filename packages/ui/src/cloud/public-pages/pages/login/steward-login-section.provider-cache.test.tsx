@@ -1,9 +1,9 @@
 /**
  * Verifies StewardLoginSection's session-cached provider fast path (#18256)
  * under a mocked Steward harness (jsdom). A per-tenant sessionStorage snapshot
- * of the last provider discovery must render cached non-wallet options
- * immediately on a repeat SPA load (no "Loading sign-in options…" roundtrip on
- * the critical path), reconcile with the live fetch when it resolves, and the
+ * of the last provider discovery must render cached non-wallet options as
+ * disabled placeholders on a repeat SPA load (no "Loading sign-in options…"
+ * roundtrip on the critical path), reconcile with the live fetch when it resolves, and the
  * completing-callback return leg must not issue a discovery fetch at all.
  * Wallet providers remain behind current-document live discovery because
  * mounting one can auto-reconnect persisted browser state. A corrupt snapshot
@@ -225,18 +225,44 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
     expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("renders cached options immediately while live discovery is still pending", () => {
+  it("renders cached options inert while live discovery is still pending", () => {
     window.sessionStorage.setItem(CACHE_KEY, JSON.stringify(CACHED_PROVIDERS));
 
     renderSection("/login");
 
-    // No blocking discovery state — the cached stack is live from first render.
+    // No blocking discovery state — the cached stack preserves layout from
+    // first render, but it cannot send or externalize authentication work.
     expect(
       screen.queryByRole("status", { name: "Loading sign-in options" }),
     ).toBeNull();
-    expect(screen.getByRole("button", { name: /^Google$/i })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /^Telegram$/i })).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: /^Google$/i,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      (
+        screen.getByRole("button", {
+          name: /^Telegram$/i,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect((screen.getByLabelText("Email") as HTMLInputElement).disabled).toBe(
+      true,
+    );
+    expect(
+      (
+        screen.getByRole("button", {
+          name: /^Magic Link$/i,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     expect(screen.queryByRole("button", { name: /^GitHub$/i })).toBeNull();
+    expect(
+      document.querySelector('script[src^="https://telegram.org/js/"]'),
+    ).toBeNull();
   });
 
   it("does not activate cached wallet providers before live discovery", () => {
@@ -251,7 +277,29 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
 
     renderSection("/login");
 
-    expect(screen.getByRole("button", { name: /^Google$/i })).toBeTruthy();
+    expect(
+      (
+        screen.getByRole("button", {
+          name: /^Google$/i,
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: /Continue with a wallet/i }),
+    ).toBeNull();
+  });
+
+  it("shows the reserved loading frame for a cached wallet-only layout", () => {
+    window.sessionStorage.setItem(
+      CACHE_KEY,
+      JSON.stringify(WALLET_ONLY_PROVIDERS),
+    );
+
+    renderSection("/login");
+
+    expect(
+      screen.getByRole("status", { name: "Loading sign-in options" }),
+    ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: /Continue with a wallet/i }),
     ).toBeNull();
@@ -283,6 +331,7 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
         screen.getByRole("button", { name: /Continue with a wallet/i }),
       ).toBeTruthy(),
     );
+    expect(screen.queryByLabelText("Email")).toBeNull();
     // The successful discovery refreshes the snapshot for the next load.
     const stored = window.sessionStorage.getItem(CACHE_KEY);
     expect(stored).not.toBeNull();
@@ -297,6 +346,9 @@ describe("StewardLoginSection — session-cached provider fast path (#18256)", (
     );
     // The module cache cannot activate its cached wallet positives before the
     // remount's live discovery resolves.
+    expect(
+      screen.getByRole("status", { name: "Loading sign-in options" }),
+    ).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: /Continue with a wallet/i }),
     ).toBeNull();

@@ -24,6 +24,11 @@ const emailLoginSpies = vi.hoisted(() => ({
   poll: vi.fn(),
 }));
 
+const providerState = vi.hoisted(() => ({
+  email: true,
+  discoveries: 0,
+}));
+
 const sessionSpies = vi.hoisted(() => ({
   sync: vi.fn(),
   recover: vi.fn(),
@@ -46,9 +51,10 @@ vi.mock("./passkey-capability", () => ({
 vi.mock("@stwd/sdk", () => ({
   StewardAuth: class {
     getProviders() {
+      providerState.discoveries += 1;
       return Promise.resolve({
         passkey: false,
-        email: true,
+        email: providerState.email,
         siwe: false,
         siws: false,
         google: false,
@@ -154,6 +160,8 @@ describe("StewardLoginSection email magic-link companion code", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     window.localStorage.clear();
+    providerState.email = true;
+    providerState.discoveries = 0;
     emailLoginSpies.start.mockResolvedValue({
       expiresAt: Date.now() + 600_000,
       challengeId: "challenge-1",
@@ -203,9 +211,170 @@ describe("StewardLoginSection email magic-link companion code", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "session-token",
         "refresh-token",
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(window.localStorage.getItem("eliza_sso_logged_out")).toBeNull();
+  });
+
+  it("revokes an active challenge and ignores its stale completion after BFCache revalidation", async () => {
+    let finishVerification:
+      | ((value: { token: string; refreshToken: string }) => void)
+      | undefined;
+    emailLoginSpies.verify.mockImplementation(
+      () =>
+        new Promise<{ token: string; refreshToken: string }>((resolve) => {
+          finishVerification = resolve;
+        }),
+    );
+
+    renderSection();
+    await startEmailLogin();
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    await waitFor(() => expect(emailLoginSpies.verify).toHaveBeenCalledOnce());
+
+    emailLoginSpies.poll.mockClear();
+    providerState.email = false;
+    const discoveriesBeforeRestore = providerState.discoveries;
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+
+    await waitFor(() =>
+      expect(providerState.discoveries).toBe(discoveriesBeforeRestore + 1),
+    );
+    expect(
+      await screen.findByText("No sign-in methods are available"),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Six-digit code")).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(emailLoginSpies.poll).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finishVerification?.({
+        token: "stale-session-token",
+        refreshToken: "stale-refresh-token",
+      });
+      await Promise.resolve();
+    });
+    expect(sessionSpies.sync).not.toHaveBeenCalled();
+    expect(screen.queryByText("Signed in")).toBeNull();
+  });
+
+  it("keeps link polling live after an invalid companion code", async () => {
+    let rejectVerification: ((error: Error) => void) | undefined;
+    emailLoginSpies.verify.mockImplementation(
+      () =>
+        new Promise((_, reject) => {
+          rejectVerification = reject;
+        }),
+    );
+    renderSection();
+    await startEmailLogin();
+
+    emailLoginSpies.poll.mockClear();
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    await waitFor(() => expect(emailLoginSpies.verify).toHaveBeenCalledOnce());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+    expect(emailLoginSpies.poll).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rejectVerification?.(new Error("Invalid code"));
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("Invalid code")).toBeTruthy();
+
+    emailLoginSpies.poll.mockResolvedValue("consumed");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    expect(await screen.findByText("Signed in")).toBeTruthy();
+    expect(sessionSpies.recoverEmail).toHaveBeenCalledWith(
+      "person@example.com",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+  });
+
+  it("aborts a pending session publication on BFCache restore", async () => {
+    let finishSessionSync: (() => void) | undefined;
+    sessionSpies.sync.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSessionSync = resolve;
+        }),
+    );
+    renderSection();
+    await startEmailLogin();
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledOnce());
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Back to login",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    const signal = sessionSpies.sync.mock.calls[0]?.[2]?.signal as AbortSignal;
+    expect(signal.aborted).toBe(false);
+
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+    expect(signal.aborted).toBe(true);
+
+    await act(async () => {
+      finishSessionSync?.();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Signed in")).toBeNull();
+  });
+
+  it("revokes a pending session publication on actual unmount", async () => {
+    let finishSessionSync: (() => void) | undefined;
+    sessionSpies.sync.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSessionSync = resolve;
+        }),
+    );
+    const view = renderSection();
+    await startEmailLogin();
+
+    fireEvent.change(screen.getByLabelText("Six-digit code"), {
+      target: { value: "123456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Verify code/i }));
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledOnce());
+    const signal = sessionSpies.sync.mock.calls[0]?.[2]?.signal as AbortSignal;
+
+    view.unmount();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(signal.aborted).toBe(true);
+
+    await act(async () => {
+      finishSessionSync?.();
+      await Promise.resolve();
+    });
+    expect(sessionSpies.sync).toHaveBeenCalledOnce();
   });
 
   it("binds consumed-link recovery to the challenged email", async () => {

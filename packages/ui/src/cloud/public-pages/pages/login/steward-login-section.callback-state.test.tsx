@@ -14,7 +14,7 @@
  */
 
 import { StewardSessionError } from "@elizaos/shared/steward-session-client";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -23,22 +23,38 @@ const callbackState = vi.hoisted(() => ({
   returnedState: "state-1" as string | null,
   expectedState: "state-1" as string | null,
   pkceVerifier: "verifier-1" as string | undefined,
+  codeAvailable: true,
+  hasAuthedCookie: false,
+  pendingReturnTo: null as string | null,
   exchangeCalls: 0,
+  exchangeSignals: [] as AbortSignal[],
   exchange: (): Promise<{ token?: string }> => new Promise(() => {}),
+  recover: vi.fn(),
+  resolveReturnTo: vi.fn(),
+  sync: vi.fn(),
 }));
 
 vi.mock("../../lib/steward-session", () => ({
   hasStewardOAuthCallbackInUrl: () => callbackState.hasCallback,
-  consumeStewardCodeFromQuery: () => "callback-code",
+  consumeStewardCodeFromQuery: () => {
+    if (!callbackState.codeAvailable) return null;
+    callbackState.codeAvailable = false;
+    callbackState.hasCallback = false;
+    return "callback-code";
+  },
   consumeStewardOAuthStateFromCallback: () => callbackState.returnedState,
   stripLegacyTokenHashFromAddressBar: () => false,
-  exchangeStewardCodeViaApi: () => {
+  exchangeStewardCodeViaApi: (
+    _code: string,
+    options?: { signal?: AbortSignal },
+  ) => {
     callbackState.exchangeCalls += 1;
+    if (options?.signal) callbackState.exchangeSignals.push(options.signal);
     return callbackState.exchange();
   },
-  recoverStewardSessionViaCookie: () => Promise.resolve(null),
+  recoverStewardSessionViaCookie: callbackState.recover,
   refreshStewardSessionViaCookie: () => Promise.resolve({ ok: true as const }),
-  syncStewardSessionCookie: () => Promise.resolve(),
+  syncStewardSessionCookie: callbackState.sync,
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", async () => {
@@ -47,6 +63,7 @@ vi.mock("@elizaos/shared/steward-session-client", async () => {
   >("@elizaos/shared/steward-session-client");
   return {
     ...actual,
+    hasStewardAuthedCookie: () => callbackState.hasAuthedCookie,
     peekStewardOAuthState: () => callbackState.expectedState,
   };
 });
@@ -101,8 +118,8 @@ vi.mock("../../lib/steward-oauth-url", async () => {
 });
 
 vi.mock("../../lib/login-return-to", () => ({
-  resolveLoginReturnTo: () => "/cloud",
-  consumePendingOAuthReturnTo: () => null,
+  resolveLoginReturnTo: callbackState.resolveReturnTo,
+  consumePendingOAuthReturnTo: () => callbackState.pendingReturnTo,
   storePendingOAuthReturnTo: () => undefined,
 }));
 
@@ -122,12 +139,20 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     callbackState.returnedState = "state-1";
     callbackState.expectedState = "state-1";
     callbackState.pkceVerifier = "verifier-1";
+    callbackState.codeAvailable = true;
+    callbackState.hasAuthedCookie = false;
+    callbackState.pendingReturnTo = null;
     callbackState.exchangeCalls = 0;
+    callbackState.exchangeSignals = [];
     callbackState.exchange = () => new Promise(() => {});
+    callbackState.recover.mockReset().mockResolvedValue(null);
+    callbackState.resolveReturnTo.mockReset().mockReturnValue("/cloud");
+    callbackState.sync.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     cleanup();
+    window.localStorage.clear();
     vi.clearAllMocks();
   });
 
@@ -144,6 +169,101 @@ describe("StewardLoginSection — OAuth callback completion state (#13519)", () 
     expect(screen.queryByRole("button", { name: /Magic Link/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /Google/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /Discord/i })).toBeNull();
+  });
+
+  it("recovers a server-committed callback and its /chat intent after BFCache restore", async () => {
+    callbackState.hasAuthedCookie = true;
+    callbackState.pendingReturnTo = "/chat";
+    callbackState.resolveReturnTo.mockReturnValue("/chat");
+    callbackState.recover.mockResolvedValue({
+      ok: true,
+      token: "restored-callback-token",
+    });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+
+    renderSection("/login?code=callback-code&state=state-1&returnTo=%2Fchat");
+    await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
+    expect(callbackState.exchangeSignals[0]?.aborted).toBe(false);
+
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    act(() => window.dispatchEvent(historyRestore));
+
+    await waitFor(() => expect(callbackState.recover).toHaveBeenCalledOnce());
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    expect(callbackState.exchangeSignals[0]?.aborted).toBe(true);
+    await waitFor(() =>
+      expect(callbackState.resolveReturnTo).toHaveBeenCalledWith(
+        expect.objectContaining({ get: expect.any(Function) }),
+        "/chat",
+      ),
+    );
+    const staleRouterSearch = callbackState.resolveReturnTo.mock.calls[0]?.[0];
+    expect(staleRouterSearch?.get("code")).toBe("callback-code");
+  });
+
+  it("keeps callback account authority across repeated BFCache restores", async () => {
+    callbackState.hasAuthedCookie = true;
+    callbackState.pendingReturnTo = "/chat";
+    callbackState.resolveReturnTo.mockReturnValue("/chat");
+    let resolveFirstRecovery: (
+      value: { ok: true; token: string } | null,
+    ) => void = () => {};
+    callbackState.recover
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirstRecovery = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        ok: true,
+        token: "second-restored-callback-token",
+      });
+    window.localStorage.setItem(
+      "steward_session_token",
+      "previous-account-token",
+    );
+
+    renderSection("/login?code=callback-code&state=state-1&returnTo=%2Fchat");
+    await waitFor(() => expect(callbackState.exchangeCalls).toBe(1));
+
+    const firstRestore = new Event("pageshow");
+    Object.defineProperty(firstRestore, "persisted", { value: true });
+    act(() => window.dispatchEvent(firstRestore));
+    await waitFor(() => expect(callbackState.recover).toHaveBeenCalledOnce());
+    const firstRecoverySignal = callbackState.recover.mock.calls[0]?.[0]
+      ?.signal as AbortSignal;
+
+    const secondRestore = new Event("pageshow");
+    Object.defineProperty(secondRestore, "persisted", { value: true });
+    act(() => window.dispatchEvent(secondRestore));
+
+    await waitFor(() => expect(callbackState.recover).toHaveBeenCalledTimes(2));
+    const secondRecoverySignal = callbackState.recover.mock.calls[1]?.[0]
+      ?.signal as AbortSignal;
+    expect(firstRecoverySignal.aborted).toBe(true);
+    expect(secondRecoverySignal.aborted).toBe(false);
+    expect(callbackState.sync).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(callbackState.resolveReturnTo).toHaveBeenCalledWith(
+        expect.objectContaining({ get: expect.any(Function) }),
+        "/chat",
+      ),
+    );
+
+    await act(async () => {
+      resolveFirstRecovery(null);
+      await Promise.resolve();
+    });
+    expect(
+      callbackState.sync.mock.calls.some(
+        ([token]) => token === "previous-account-token",
+      ),
+    ).toBe(false);
   });
 
   it("clears the completing state and surfaces the error when the callback exchange fails", async () => {

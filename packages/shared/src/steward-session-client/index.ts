@@ -45,9 +45,14 @@ let stewardTokenMutationTail: Promise<void> = Promise.resolve();
 
 type StewardTokenRemoval = () => Promise<void>;
 type StewardTokenPersistence = (token: string) => Promise<void>;
+type StewardTokenCompareAndRestore = (
+  expectedToken: string,
+  restoreToken: string | null,
+) => Promise<boolean>;
 
 let stewardTokenRemoval: StewardTokenRemoval | null = null;
 let stewardTokenPersistence: StewardTokenPersistence | null = null;
+let stewardTokenCompareAndRestore: StewardTokenCompareAndRestore | null = null;
 
 /**
  * Orders canonical token writes and removals through their authority event.
@@ -135,6 +140,22 @@ export function registerStewardTokenPersistence(
   return () => {
     if (stewardTokenPersistence === persistence) {
       stewardTokenPersistence = null;
+    }
+  };
+}
+
+/**
+ * Installs the host-owned exact-value rollback boundary for an interrupted
+ * Steward token write. The callback restores `restoreToken` only while the
+ * durable current value still equals `expectedToken`; a newer value wins.
+ */
+export function registerStewardTokenCompareAndRestore(
+  compareAndRestore: StewardTokenCompareAndRestore,
+): () => void {
+  stewardTokenCompareAndRestore = compareAndRestore;
+  return () => {
+    if (stewardTokenCompareAndRestore === compareAndRestore) {
+      stewardTokenCompareAndRestore = null;
     }
   };
 }
@@ -416,21 +437,70 @@ async function persistStoredStewardToken(
   }
 }
 
+async function compareAndRestoreStoredStewardToken(
+  expectedToken: string,
+  restoreToken: string | null,
+): Promise<boolean> {
+  if (stewardTokenCompareAndRestore) {
+    return stewardTokenCompareAndRestore(expectedToken, restoreToken);
+  }
+  if (window.localStorage.getItem(STEWARD_TOKEN_KEY) !== expectedToken) {
+    return false;
+  }
+  if (restoreToken === null) {
+    window.localStorage.removeItem(STEWARD_TOKEN_KEY);
+  } else {
+    window.localStorage.setItem(STEWARD_TOKEN_KEY, restoreToken);
+  }
+  return true;
+}
+
+export interface StewardTokenWriteOptions {
+  signal?: AbortSignal;
+}
+
 /**
  * Persists the canonical token and publishes authority only after the durable
  * host boundary succeeds. A protected-store rejection never becomes a
  * healthy-looking in-memory login that disappears on relaunch.
  */
-export async function writeStoredStewardToken(token: string): Promise<void> {
+export async function writeStoredStewardToken(
+  token: string,
+  options?: StewardTokenWriteOptions,
+): Promise<void> {
   if (typeof window === "undefined") return;
   await serializeStewardTokenMutation(async () => {
+    options?.signal?.throwIfAborted();
     const requiredScope = configuredLoopbackStewardScope();
+    const previousToken = window.localStorage.getItem(STEWARD_TOKEN_KEY);
+    const previousScope = window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY);
     const wasCurrent =
-      window.localStorage.getItem(STEWARD_TOKEN_KEY) === token &&
-      (!requiredScope ||
-        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope);
+      previousToken === token &&
+      (!requiredScope || previousScope === requiredScope);
     if (!stewardTokenPersistence && wasCurrent) return;
     await persistStoredStewardToken(token, requiredScope);
+    if (options?.signal?.aborted) {
+      try {
+        const restored = await compareAndRestoreStoredStewardToken(
+          token,
+          previousToken,
+        );
+        if (
+          restored &&
+          requiredScope &&
+          window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope
+        ) {
+          if (previousScope === null) {
+            window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+          } else {
+            window.localStorage.setItem(STEWARD_TOKEN_SCOPE_KEY, previousScope);
+          }
+        }
+      } catch (error) {
+        throw new StewardTokenPersistenceError(error);
+      }
+      options.signal.throwIfAborted();
+    }
     if (!wasCurrent) dispatchStewardSessionChange("present");
   });
 }

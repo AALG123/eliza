@@ -54,6 +54,7 @@ const returnToSpies = vi.hoisted(() => ({
 }));
 
 vi.mock("@elizaos/shared/steward-session-client", () => ({
+  consumeStewardPkceVerifier: vi.fn(),
   hasStewardAuthedCookie: () => false,
   readStoredStewardToken: () => sessionSpies.storedToken,
   writeStoredStewardToken: (token: string) => {
@@ -215,9 +216,48 @@ describe("StewardLoginSection phone login", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "existing-session-token",
         null,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(authSpies.refreshSession).not.toHaveBeenCalled();
+  });
+
+  it("restarts session recovery after BFCache restore and ignores the pre-freeze completion", async () => {
+    sessionSpies.storedToken = "existing-session-token";
+    const finishSyncs: Array<() => void> = [];
+    sessionSpies.sync.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishSyncs.push(resolve);
+        }),
+    );
+
+    renderSection();
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledTimes(1));
+    const firstSignal = sessionSpies.sync.mock.calls[0]?.[2]
+      ?.signal as AbortSignal;
+
+    const historyRestore = new Event("pageshow");
+    Object.defineProperty(historyRestore, "persisted", { value: true });
+    fireEvent(window, historyRestore);
+
+    await waitFor(() => expect(sessionSpies.sync).toHaveBeenCalledTimes(2));
+    const secondSignal = sessionSpies.sync.mock.calls[1]?.[2]
+      ?.signal as AbortSignal;
+    expect(firstSignal.aborted).toBe(true);
+    expect(secondSignal.aborted).toBe(false);
+
+    await act(async () => {
+      finishSyncs[0]?.();
+      await Promise.resolve();
+    });
+    expect(returnToSpies.resolve).not.toHaveBeenCalled();
+
+    await act(async () => {
+      finishSyncs[1]?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(returnToSpies.resolve).toHaveBeenCalledOnce());
   });
 
   it("renders only one method divider when phone and OAuth are available", async () => {
@@ -348,6 +388,7 @@ describe("StewardLoginSection phone login", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "older-session-token",
         null,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(screen.queryByLabelText("Phone number")).toBeNull();
@@ -373,6 +414,7 @@ describe("StewardLoginSection phone login", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "older-session-token",
         null,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
       ),
     );
     expect(screen.queryByLabelText("Phone number")).toBeNull();
@@ -398,7 +440,10 @@ describe("StewardLoginSection phone login", () => {
       expect(sessionSpies.sync).toHaveBeenCalledWith(
         "sms-session-token",
         "sms-refresh-token",
-        { verifiedPhone: "+14155552671" },
+        expect.objectContaining({
+          signal: expect.any(AbortSignal),
+          verifiedPhone: "+14155552671",
+        }),
       ),
     );
     expect(sessionSpies.write).toHaveBeenCalledWith("sms-session-token");

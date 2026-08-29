@@ -215,6 +215,7 @@ describe("recoverStewardEmailSessionViaCookie", () => {
 describe("recoverStewardSessionViaCookie", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    vi.useRealTimers();
   });
 
   it("returns the first healthy refresh without clearing the session", async () => {
@@ -254,6 +255,33 @@ describe("recoverStewardSessionViaCookie", () => {
     expect(
       fetchMock.mock.calls.every(([, init]) => init?.method === "POST"),
     ).toBe(true);
+  });
+
+  it("stops before retry or cleanup when the recovery authority is revoked", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        jsonResponse(
+          { error: "Refresh token rejected", code: "invalid_token" },
+          401,
+        ),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const controller = new AbortController();
+
+    const recovery = recoverStewardSessionViaCookie({
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(100);
+
+    await expect(recovery).resolves.toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      signal: controller.signal,
+    });
   });
 
   it("clears a dead cookie session after two rejected refreshes", async () => {

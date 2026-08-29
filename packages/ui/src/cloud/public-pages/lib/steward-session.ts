@@ -89,6 +89,7 @@ export async function syncStewardSessionCookie(
   token: string,
   refreshToken?: string | null,
   options?: {
+    signal?: AbortSignal;
     verifiedPhone?: string;
   },
 ): Promise<void> {
@@ -102,7 +103,7 @@ export async function syncStewardSessionCookie(
     STEWARD_SESSION_ENDPOINT,
     request,
     "POST",
-    undefined,
+    options?.signal,
     sessionEndpoint,
   );
 
@@ -112,6 +113,11 @@ export async function syncStewardSessionCookie(
       body.error || "Could not establish an Eliza Cloud session.",
     );
   }
+
+  // A provider completion can lose authority while this POST is in flight
+  // (BFCache restoration, cancellation, or unmount). Never publish its token
+  // after the caller revokes the owning intent.
+  options?.signal?.throwIfAborted();
 
   if (typeof window !== "undefined") {
     // The server cookie is authoritative at this endpoint now. Record this
@@ -123,7 +129,9 @@ export async function syncStewardSessionCookie(
     // The cookie boundary may be entered directly by an SDK callback or after
     // the login page already persisted the same token. Canonical storage is
     // idempotent, so both paths publish one authority transition in total.
-    await writeStoredStewardToken(token);
+    options?.signal?.throwIfAborted();
+    await writeStoredStewardToken(token, { signal: options?.signal });
+    options?.signal?.throwIfAborted();
     window.dispatchEvent(
       new CustomEvent("steward-token-sync", { detail: { token } }),
     );
@@ -327,14 +335,24 @@ export function stripLegacyTokenHashFromAddressBar(): boolean {
  */
 export async function exchangeStewardCodeViaApi(
   code: string,
-  opts: { redirectUri?: string; tenantId?: string; codeVerifier?: string } = {},
+  opts: {
+    redirectUri?: string;
+    tenantId?: string;
+    codeVerifier?: string;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<StewardNonceExchangeResponse> {
-  const response = await postAuthJson(STEWARD_NONCE_EXCHANGE_ENDPOINT, {
-    code,
-    ...(opts.redirectUri ? { redirectUri: opts.redirectUri } : {}),
-    ...(opts.tenantId ? { tenantId: opts.tenantId } : {}),
-    ...(opts.codeVerifier ? { codeVerifier: opts.codeVerifier } : {}),
-  });
+  const response = await postAuthJson(
+    STEWARD_NONCE_EXCHANGE_ENDPOINT,
+    {
+      code,
+      ...(opts.redirectUri ? { redirectUri: opts.redirectUri } : {}),
+      ...(opts.tenantId ? { tenantId: opts.tenantId } : {}),
+      ...(opts.codeVerifier ? { codeVerifier: opts.codeVerifier } : {}),
+    },
+    "POST",
+    opts.signal,
+  );
 
   if (!response.ok) {
     const body = await readSessionError(response);
@@ -493,15 +511,18 @@ function isRejectedCookieSession(error: unknown): boolean {
   );
 }
 
-async function clearRejectedCookieSession(): Promise<void> {
+async function clearRejectedCookieSession(signal?: AbortSignal): Promise<void> {
   // The DELETE and subsequent token removal can each fail. Retire proof before
   // either boundary so recovery can never reuse pre-clear cookie authority.
+  signal?.throwIfAborted();
   invalidateStewardServerCookieSyncMarker();
   const response = await postAuthJson(
     STEWARD_SESSION_ENDPOINT,
     undefined,
     "DELETE",
+    signal,
   );
+  signal?.throwIfAborted();
   if (!response.ok) {
     const body = await readSessionError(response);
     throw new StewardSessionError(
@@ -510,6 +531,7 @@ async function clearRejectedCookieSession(): Promise<void> {
       body.code ?? null,
     );
   }
+  signal?.throwIfAborted();
   await clearStoredStewardToken();
 }
 
@@ -520,27 +542,40 @@ async function clearRejectedCookieSession(): Promise<void> {
  * response settles; a second auth rejection proves the cookie is stale enough
  * to clear before rendering a clean sign-in form.
  */
-export async function recoverStewardSessionViaCookie(): Promise<{
+export async function recoverStewardSessionViaCookie(
+  options: { signal?: AbortSignal } = {},
+): Promise<{
   ok: true;
   expiresAt?: number;
   expiresIn?: number;
   token?: string;
 } | null> {
+  if (options.signal?.aborted) return null;
   try {
-    return await refreshStewardSessionViaCookie();
+    const session = await refreshStewardSessionViaCookie({
+      signal: options.signal,
+    });
+    return options.signal?.aborted ? null : session;
   } catch (error) {
+    if (options.signal?.aborted || isAbortError(error)) return null;
     if (!isRejectedCookieSession(error)) throw error;
   }
 
-  await new Promise((resolve) => {
-    setTimeout(resolve, DEAD_SESSION_RETRY_DELAY_MS);
-  });
+  const shouldRetry = await waitForRecoveryDelay(
+    DEAD_SESSION_RETRY_DELAY_MS,
+    options.signal,
+  );
+  if (!shouldRetry) return null;
 
   try {
-    return await refreshStewardSessionViaCookie();
+    const session = await refreshStewardSessionViaCookie({
+      signal: options.signal,
+    });
+    return options.signal?.aborted ? null : session;
   } catch (error) {
+    if (options.signal?.aborted || isAbortError(error)) return null;
     if (!isRejectedCookieSession(error)) throw error;
-    await clearRejectedCookieSession();
+    await clearRejectedCookieSession(options.signal);
     return null;
   }
 }

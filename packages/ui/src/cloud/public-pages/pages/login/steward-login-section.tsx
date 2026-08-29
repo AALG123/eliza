@@ -40,6 +40,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -180,8 +181,12 @@ type EmailCheckState =
   | "locked"
   | "invalid";
 
-async function persistStewardToken(token: string): Promise<void> {
-  await writeStoredStewardToken(token);
+async function persistStewardToken(
+  token: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  await writeStoredStewardToken(token, { signal });
+  signal?.throwIfAborted();
   if (readStoredStewardToken() !== token) {
     throw new Error(
       "Eliza Cloud sign-in needs browser storage. Enable storage for this site and try again.",
@@ -661,14 +666,23 @@ export default function StewardLoginSection() {
   const [showPasskeyEnrollmentRecovery, setShowPasskeyEnrollmentRecovery] =
     useState(false);
   const [telegramIntent, setTelegramIntent] = useState(false);
+  const [telegramIntentGeneration, setTelegramIntentGeneration] = useState<
+    number | null
+  >(null);
   const telegramIntentButtonRef = useRef<HTMLButtonElement>(null);
   const telegramRegionRef = useRef<HTMLFieldSetElement>(null);
   // Wallet libs mount only on intent: the first wallet-button click renders
   // the (lazy) providers + buttons and auto-starts that wallet's flow.
   const [walletButtonsMounted, setWalletButtonsMounted] = useState(false);
+  const [mountedWalletKind, setMountedWalletKind] = useState<WalletKind | null>(
+    null,
+  );
   const [autoStartWallet, setAutoStartWallet] = useState<WalletKind | null>(
     null,
   );
+  const [walletIntentGeneration, setWalletIntentGeneration] = useState<
+    number | null
+  >(null);
   // Wallet methods are collapsed behind a single toggle by default so email /
   // Magic Link is the clear above-the-fold primary action (#19217). Expanding
   // reveals the EVM / Solana peer buttons; clicking one mounts the lazy wallet
@@ -687,6 +701,7 @@ export default function StewardLoginSection() {
   const [sessionRecoveryComplete, setSessionRecoveryComplete] = useState(
     PLAYWRIGHT_TEST_AUTH_ENABLED,
   );
+  const [sessionRecoveryAttempt, setSessionRecoveryAttempt] = useState(0);
   const [externalSuccessDestination, setExternalSuccessDestination] = useState<
     string | null
   >(null);
@@ -702,6 +717,23 @@ export default function StewardLoginSection() {
       }
     | undefined
   >(undefined);
+  // Every provider flow captures this document-local generation. A BFCache
+  // restore, explicit cancellation, or a replacement intent rotates it and
+  // aborts work that supports AbortSignal; SDK calls without abort support are
+  // still prevented from publishing stale completion state or credentials.
+  const providerIntentGenerationRef = useRef(0);
+  const providerIntentAbortRef = useRef(new AbortController());
+  const providerIntentLifecycleRef = useRef(0);
+  const providerIntentCleanupPendingRef = useRef<number | null>(null);
+  const [providerIntentRevision, setProviderIntentRevision] = useState(0);
+  // Once a provider has returned credentials and the Cloud session POST starts,
+  // the server-side cookie commit is no longer safely reversible client-side.
+  // Keep recovery controls available through provider/wallet cancellation, then
+  // lock them only across this final authority commit.
+  const sessionCommitGenerationRef = useRef<number | null>(null);
+  const [sessionCommitGeneration, setSessionCommitGeneration] = useState<
+    number | null
+  >(null);
   // Detected once, synchronously, BEFORE the callback-consuming effect below
   // strips `?code`/`#code` from the URL. While this is true the section shows a
   // terminal "completing sign-in" state instead of re-rendering the provider
@@ -711,6 +743,13 @@ export default function StewardLoginSection() {
   const [completingCallback, setCompletingCallback] = useState<boolean>(() =>
     PLAYWRIGHT_TEST_AUTH_ENABLED ? false : hasStewardOAuthCallbackInUrl(),
   );
+  // React Router keeps its own location snapshot when the one-time callback
+  // code is stripped with history.replaceState. Block ordinary recovery while
+  // that callback owns the document, then explicitly release it on BFCache
+  // restoration so a server-committed HttpOnly session can be rehydrated.
+  const callbackRecoveryBlockedRef = useRef(false);
+  const callbackExchangeStartedRef = useRef(false);
+  const recoverPendingOAuthReturnToRef = useRef(false);
   const [providersLoaded, setProvidersLoaded] = useState(
     () =>
       PLAYWRIGHT_TEST_AUTH_ENABLED ||
@@ -728,12 +767,15 @@ export default function StewardLoginSection() {
       (PLAYWRIGHT_TEST_AUTH_ENABLED ? DEFAULT_PROVIDERS : null),
   );
   // A sessionStorage/module snapshot is a paint accelerator, not an
-  // authorization signal. Wallet provider mounts can auto-reconnect persisted
-  // browser state, so require a successful live discovery for this document
-  // before exposing either wallet intent.
-  const [walletProvidersConfirmed, setWalletProvidersConfirmed] = useState(
+  // authorization signal. Every provider action can send a credential,
+  // externalize an OAuth intent, or reconnect persisted wallet state, so a
+  // successful live discovery is required for this document before any cached
+  // option becomes actionable.
+  const [providersLiveConfirmed, setProvidersLiveConfirmed] = useState(
     PLAYWRIGHT_TEST_AUTH_ENABLED,
   );
+  const providersLiveConfirmedRef = useRef(PLAYWRIGHT_TEST_AUTH_ENABLED);
+  const providersRef = useRef<StewardProviders | null>(providers);
   const [passkeyCapability, setPasskeyCapability] =
     useState<WebPasskeyCapability | null>(
       PLAYWRIGHT_TEST_AUTH_ENABLED
@@ -750,24 +792,35 @@ export default function StewardLoginSection() {
           ),
     [providers],
   );
+  const telegramRenderable =
+    providers?.telegram === true && Boolean(telegramBotUsername);
   const hasIdentityProviders =
-    enabledOAuthProviders.length > 0 || providers?.telegram === true;
-  const emailEnabled = providers !== null && providers.email !== false;
+    enabledOAuthProviders.length > 0 || telegramRenderable;
+  const emailEnabled = providers?.email === true;
   const showWallets =
-    walletProvidersConfirmed &&
+    providersLiveConfirmed &&
     providers !== null &&
     hasAnyWalletProvider(providers);
   const showPasskey =
-    providers !== null &&
-    providers.passkey !== false &&
-    passkeyCapability?.usable === true;
-  const hasUsableNonWalletProvider =
+    providers?.passkey === true && passkeyCapability?.usable === true;
+  const passkeyProbePending =
+    providers?.passkey === true && passkeyCapability === null;
+  const showEmailEntry = emailEnabled || showPasskey || passkeyProbePending;
+  const hasRenderableNonWalletMethod =
     providers !== null &&
     (emailEnabled ||
       providers.sms === true ||
       showPasskey ||
+      passkeyProbePending ||
       hasIdentityProviders ||
       LOCAL_DEDICATED_TEST_SIGN_IN_ENABLED);
+  const hasUsableMethod = hasRenderableNonWalletMethod || showWallets;
+  const providerLayoutAwaitingLiveAuthority =
+    providers !== null &&
+    !providersLiveConfirmed &&
+    providerDiscoveryError === null &&
+    !hasRenderableNonWalletMethod;
+  const providerActionsDisabled = loading !== null || !providersLiveConfirmed;
 
   const abortSharedEmailSessionRecovery = useCallback(() => {
     const pending = sharedSessionRecoveryRef.current;
@@ -775,6 +828,64 @@ export default function StewardLoginSection() {
     sharedSessionRecoveryRef.current = undefined;
     pending.controller.abort();
   }, []);
+
+  const revokeProviderIntent = useCallback(() => {
+    abortSharedEmailSessionRecovery();
+    providerIntentAbortRef.current.abort();
+    providerIntentGenerationRef.current += 1;
+  }, [abortSharedEmailSessionRecovery]);
+
+  const rotateProviderIntent = useCallback(() => {
+    sessionCommitGenerationRef.current = null;
+    setSessionCommitGeneration(null);
+    revokeProviderIntent();
+    providerIntentAbortRef.current = new AbortController();
+    setProviderIntentRevision(providerIntentGenerationRef.current);
+    return {
+      generation: providerIntentGenerationRef.current,
+      signal: providerIntentAbortRef.current.signal,
+    };
+  }, [revokeProviderIntent]);
+
+  const isProviderGenerationCurrent = useCallback((generation: number) => {
+    return (
+      generation === providerIntentGenerationRef.current &&
+      providerIntentCleanupPendingRef.current === null &&
+      !providerIntentAbortRef.current.signal.aborted
+    );
+  }, []);
+
+  const isProviderIntentCurrent = useCallback(
+    (generation: number) =>
+      isProviderGenerationCurrent(generation) &&
+      providersLiveConfirmedRef.current,
+    [isProviderGenerationCurrent],
+  );
+
+  const setLiveProviderAuthority = useCallback((confirmed: boolean) => {
+    providersLiveConfirmedRef.current = confirmed;
+    setProvidersLiveConfirmed(confirmed);
+  }, []);
+
+  useLayoutEffect(() => {
+    const lifecycle = providerIntentLifecycleRef.current + 1;
+    providerIntentLifecycleRef.current = lifecycle;
+    providerIntentCleanupPendingRef.current = null;
+    return () => {
+      // React StrictMode immediately replays effect setup after its development
+      // cleanup. Defer revocation one microtask so that replay can supersede
+      // this lifecycle, while an actual unmount still invalidates every intent.
+      providerIntentCleanupPendingRef.current = lifecycle;
+      queueMicrotask(() => {
+        if (
+          providerIntentLifecycleRef.current === lifecycle &&
+          providerIntentCleanupPendingRef.current === lifecycle
+        ) {
+          revokeProviderIntent();
+        }
+      });
+    };
+  }, [revokeProviderIntent]);
 
   const recoverSharedEmailSession = useCallback(() => {
     const expected = email.trim().toLowerCase();
@@ -816,39 +927,76 @@ export default function StewardLoginSection() {
   }, [abortSharedEmailSessionRecovery, activeEmailChallengeKey]);
 
   useEffect(() => {
-    const recoverOAuthIntentAfterHistoryRestore = (
+    const recoverProviderAuthorityAfterHistoryRestore = (
       event: PageTransitionEvent,
     ) => {
       if (!event.persisted) return;
-      setLoading((current) => {
-        if (
-          current !== null &&
-          STEWARD_OAUTH_PROVIDERS.some((provider) => provider === current)
-        ) {
-          return null;
-        }
-        return current;
-      });
+      // A BFCache document can outlive the server capability snapshot that
+      // authorized it. Rotate the intent generation synchronously so stale SDK
+      // completions cannot publish while React is still committing this reset.
+      recoverPendingOAuthReturnToRef.current =
+        recoverPendingOAuthReturnToRef.current ||
+        callbackExchangeStartedRef.current;
+      callbackExchangeStartedRef.current = false;
+      callbackRecoveryBlockedRef.current = false;
+      rotateProviderIntent();
+      discardStewardProvidersRequest();
+      consumeStewardPkceVerifier();
+      setLiveProviderAuthority(false);
+      setProviderDiscoveryError(null);
+      setProvidersLoaded(false);
+      setSessionRecoveryComplete(PLAYWRIGHT_TEST_AUTH_ENABLED);
+      setSessionRecoveryAttempt((attempt) => attempt + 1);
+      setEmailChallenge(null);
+      setEmailCode("");
+      setEmailCheckState("pending");
+      setShowUndeclaredCodeEntry(false);
+      setSmsCode("");
+      setOtpCode("");
+      setPasskeyEmailGrant(null);
+      setShowPasskeyRecovery(false);
+      setShowPasskeyEnrollmentRecovery(false);
+      setResendAvailableAt(0);
+      setResendRemainingSeconds(0);
+      setStep("idle");
+      setError(null);
+      setCallbackError(null);
+      setCompletingCallback(false);
+      setExternalSuccessDestination(null);
+      setRedirectTo(null);
+      setWalletButtonsMounted(false);
+      setMountedWalletKind(null);
+      setAutoStartWallet(null);
+      setWalletIntentGeneration(null);
+      setShowWalletOptions(false);
+      setTelegramIntent(false);
+      setTelegramIntentGeneration(null);
+      setLoading(null);
+      setProviderDiscoveryAttempt((attempt) => attempt + 1);
     };
 
     // OAuth owns the current document, but browser Back may revive this React
     // tree from the back/forward cache with its pre-navigation loading state.
     // A fresh load already starts idle; only a persisted history restoration
     // needs to release the provider lock (#20385).
-    window.addEventListener("pageshow", recoverOAuthIntentAfterHistoryRestore);
+    window.addEventListener(
+      "pageshow",
+      recoverProviderAuthorityAfterHistoryRestore,
+    );
     return () => {
       window.removeEventListener(
         "pageshow",
-        recoverOAuthIntentAfterHistoryRestore,
+        recoverProviderAuthorityAfterHistoryRestore,
       );
     };
-  }, []);
+  }, [rotateProviderIntent, setLiveProviderAuthority]);
 
   useEffect(() => {
     // The nonce is the explicit retry trigger for this discovery effect.
     void providerDiscoveryAttempt;
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) {
       setProvidersLoaded(true);
+      setLiveProviderAuthority(true);
       return;
     }
     // On the post-OAuth return leg the section shows only the terminal
@@ -858,42 +1006,78 @@ export default function StewardLoginSection() {
     // effect re-runs, so the retry surface still gets live discovery.
     if (completingCallback) return;
     let cancelled = false;
+    const requestGeneration = stewardProvidersRequestGeneration;
     loadStewardProvidersWithTimeout(auth)
       .then((loadedProviders) => {
-        if (!cancelled) {
+        if (
+          !cancelled &&
+          requestGeneration === stewardProvidersRequestGeneration
+        ) {
           setProviderDiscoveryError(null);
+          providersRef.current = loadedProviders;
           setProviders(loadedProviders);
-          setWalletProvidersConfirmed(true);
+          setLiveProviderAuthority(true);
         }
       })
       .catch((providerError: unknown) => {
+        if (
+          cancelled ||
+          requestGeneration !== stewardProvidersRequestGeneration
+        ) {
+          return;
+        }
         discardStewardProvidersRequest();
-        if (cancelled) return;
-        // A cached non-wallet method can remain usable, but wallet mounts stay
-        // gated on live discovery. Always retain the failure so wallet-only
-        // tenants receive a recovery surface instead of an empty form, while
-        // mixed tenants can show the same retry non-destructively.
+        setLiveProviderAuthority(false);
+        // Keep the cached layout visible for continuity, but retain the
+        // failure and keep every provider action inert until Retry establishes
+        // current-document authority.
         setProviderDiscoveryError(
           getErrorMessage(providerError, "Steward provider discovery failed"),
         );
+        setProvidersLoaded(true);
       })
       .finally(() => {
-        if (!cancelled) setProvidersLoaded(true);
+        if (
+          !cancelled &&
+          requestGeneration === stewardProvidersRequestGeneration
+        ) {
+          setProvidersLoaded(true);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [auth, completingCallback, providerDiscoveryAttempt]);
+  }, [
+    auth,
+    completingCallback,
+    providerDiscoveryAttempt,
+    setLiveProviderAuthority,
+  ]);
 
   const retryProviderDiscovery = useCallback(() => {
     // Return to the reserved loading geometry and trigger a fresh server query;
     // never render a fabricated subset of sign-in methods.
+    rotateProviderIntent();
     discardStewardProvidersRequest();
     setProviderDiscoveryError(null);
     setProvidersLoaded(false);
-    setWalletProvidersConfirmed(false);
+    setLiveProviderAuthority(false);
+    setEmailChallenge(null);
+    setEmailCode("");
+    setSmsCode("");
+    setOtpCode("");
+    setPasskeyEmailGrant(null);
+    setStep("idle");
+    setLoading(null);
+    setWalletButtonsMounted(false);
+    setMountedWalletKind(null);
+    setAutoStartWallet(null);
+    setWalletIntentGeneration(null);
+    setShowWalletOptions(false);
+    setTelegramIntent(false);
+    setTelegramIntentGeneration(null);
     setProviderDiscoveryAttempt((attempt) => attempt + 1);
-  }, []);
+  }, [rotateProviderIntent, setLiveProviderAuthority]);
 
   useEffect(() => {
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
@@ -909,8 +1093,11 @@ export default function StewardLoginSection() {
   }, []);
 
   useEffect(() => {
+    const callbackGeneration = providerIntentGenerationRef.current;
+    const callbackSignal = providerIntentAbortRef.current.signal;
     const code = consumeStewardCodeFromQuery();
     if (code) {
+      callbackRecoveryBlockedRef.current = true;
       // The OAuth `state` echo must exactly match the value stashed at
       // /authorize time, and the PKCE verifier must still be in storage. A
       // callback missing either is a planted or stale link: refusing the
@@ -942,17 +1129,21 @@ export default function StewardLoginSection() {
         );
         return;
       }
+      callbackExchangeStartedRef.current = true;
       exchangeStewardCodeViaApi(code, {
         redirectUri: buildStewardOAuthRedirectUri(window.location.origin),
         tenantId: STEWARD_TENANT_ID,
         codeVerifier,
+        signal: callbackSignal,
       })
         .then(async (res) => {
+          if (!isProviderGenerationCurrent(callbackGeneration)) return;
           let token = res?.token;
           if (!token) {
-            const refreshed = await refreshStewardSessionViaCookie().catch(
-              () => null,
-            );
+            const refreshed = await refreshStewardSessionViaCookie({
+              signal: callbackSignal,
+            }).catch(() => null);
+            if (!isProviderGenerationCurrent(callbackGeneration)) return;
             token = refreshed?.token;
           }
           if (!token) {
@@ -960,18 +1151,27 @@ export default function StewardLoginSection() {
               "Sign-in completed, but the browser session could not be hydrated. Refresh and try again.",
             );
           }
-          await persistStewardToken(token);
+          if (!isProviderGenerationCurrent(callbackGeneration)) return;
+          await persistStewardToken(token, callbackSignal);
+          if (!isProviderGenerationCurrent(callbackGeneration)) return;
           window.dispatchEvent(new CustomEvent("steward-token-sync"));
           setRedirectTo(
             resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
           );
         })
         .catch((sessionError) => {
+          if (!isProviderGenerationCurrent(callbackGeneration)) return;
+          callbackExchangeStartedRef.current = false;
           setCompletingCallback(false);
           setCallbackError(describeCodeExchangeError(sessionError, t));
         });
       return;
     }
+
+    // A rerender can re-run this effect after the one-time code was already
+    // stripped, while its exchange still owns the document. Do not mistake
+    // that consumed URL for an ordinary login page and flash the form back.
+    if (callbackRecoveryBlockedRef.current) return;
 
     // No OAuth code: drop any legacy credential link from the address bar.
     // Neither `?token=` nor `#token=` is ever consumed — a clicked link must
@@ -981,7 +1181,7 @@ export default function StewardLoginSection() {
     stripLegacyTokenParamsFromAddressBar();
     stripLegacyTokenHashFromAddressBar();
     setCompletingCallback(false);
-  }, [searchParams, t]);
+  }, [isProviderGenerationCurrent, searchParams, t]);
 
   useEffect(() => {
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
@@ -1020,27 +1220,51 @@ export default function StewardLoginSection() {
   }, [navigate, pathname, searchParams]);
 
   useEffect(() => {
+    // A persisted pageshow increments this nonce so session recovery is
+    // re-created under the new provider-intent generation instead of allowing
+    // a pre-freeze request to overtake the restored document.
+    void sessionRecoveryAttempt;
     if (PLAYWRIGHT_TEST_AUTH_ENABLED) return;
     if (searchParams.get("switchAccount") === "1") return;
-    if (searchParams.get("code") || searchParams.get("error")) {
+    if (callbackRecoveryBlockedRef.current || searchParams.get("error")) {
       setSessionRecoveryComplete(true);
       return;
     }
 
     setSessionRecoveryComplete(false);
     let cancelled = false;
+    const recoveryGeneration = providerIntentGenerationRef.current;
+    const recoverySignal = providerIntentAbortRef.current.signal;
+    const recoveringOAuthCallback = recoverPendingOAuthReturnToRef.current;
+    const recoveryIsCurrent = () =>
+      !cancelled && isProviderGenerationCurrent(recoveryGeneration);
+    const resolveRecoveredReturnTo = () => {
+      const pendingReturnTo = recoverPendingOAuthReturnToRef.current
+        ? consumePendingOAuthReturnTo()
+        : null;
+      recoverPendingOAuthReturnToRef.current = false;
+      return resolveLoginReturnTo(searchParams, pendingReturnTo);
+    };
 
     const tryRecoverSession = async () => {
       try {
-        const storedToken = readStoredStewardToken();
+        // A nonce exchange may already have committed a different account to
+        // the HttpOnly cookie before BFCache revoked its client continuation.
+        // In that case the server cookie wins; replaying a stale local token
+        // first could overwrite the newly selected account.
+        const storedToken = recoveringOAuthCallback
+          ? null
+          : readStoredStewardToken();
         if (storedToken) {
           try {
             // Session recovery establishes auth only. A pending Telegram claim
             // remains inert until /get-started previews it and the user
             // confirms it explicitly.
-            await syncStewardSessionCookie(storedToken, null);
-            if (!cancelled) {
-              setRedirectTo(resolveLoginReturnTo(searchParams));
+            await syncStewardSessionCookie(storedToken, null, {
+              signal: recoverySignal,
+            });
+            if (recoveryIsCurrent()) {
+              setRedirectTo(resolveRecoveredReturnTo());
             }
             return;
           } catch (storedTokenError) {
@@ -1052,17 +1276,22 @@ export default function StewardLoginSection() {
         }
 
         if (hasStewardAuthedCookie()) {
-          const refreshed = await recoverStewardSessionViaCookie();
-          if (cancelled) return;
+          const refreshed = await recoverStewardSessionViaCookie({
+            signal: recoverySignal,
+          });
+          if (!recoveryIsCurrent()) return;
           if (refreshed?.token) {
-            await writeStoredStewardToken(refreshed.token);
+            await writeStoredStewardToken(refreshed.token, {
+              signal: recoverySignal,
+            });
+            if (!recoveryIsCurrent()) return;
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
-            setRedirectTo(resolveLoginReturnTo(searchParams));
+            setRedirectTo(resolveRecoveredReturnTo());
           }
           return;
         }
       } catch (sessionError) {
-        if (!cancelled) {
+        if (recoveryIsCurrent()) {
           setError(
             getErrorMessage(
               sessionError,
@@ -1071,7 +1300,7 @@ export default function StewardLoginSection() {
           );
         }
       } finally {
-        if (!cancelled) setSessionRecoveryComplete(true);
+        if (recoveryIsCurrent()) setSessionRecoveryComplete(true);
       }
     };
 
@@ -1080,7 +1309,7 @@ export default function StewardLoginSection() {
     return () => {
       cancelled = true;
     };
-  }, [searchParams]);
+  }, [isProviderGenerationCurrent, searchParams, sessionRecoveryAttempt]);
 
   useEffect(() => {
     const errorCode = searchParams.get("error");
@@ -1103,6 +1332,7 @@ export default function StewardLoginSection() {
   useEffect(() => {
     if (
       step !== "email-sent" ||
+      loading === "email" ||
       !emailChallenge?.challengeId ||
       !emailChallenge.pollSecret
     ) {
@@ -1111,25 +1341,34 @@ export default function StewardLoginSection() {
     if (emailCheckState !== "pending") return;
 
     const { challengeId, pollSecret } = emailChallenge;
+    const intentGeneration = providerIntentRevision;
+    const intentSignal = providerIntentAbortRef.current.signal;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
     const poll = async () => {
       try {
         const status = await pollStewardEmailSignInStatus(
-          { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
+          {
+            baseUrl: stewardApiUrl,
+            tenantId: STEWARD_TENANT_ID,
+            signal: intentSignal,
+          },
           challengeId,
           pollSecret,
         );
-        if (cancelled) return;
+        if (cancelled || !isProviderIntentCurrent(intentGeneration)) return;
         const mapped = mapChallengeStatus(status);
         if (mapped === "approved") {
           try {
             const recovered = await recoverSharedEmailSession();
-            if (cancelled) return;
+            if (cancelled || !isProviderIntentCurrent(intentGeneration)) {
+              return;
+            }
             if (recovered) {
               if (recovered.token) {
-                await persistStewardToken(recovered.token);
+                await persistStewardToken(recovered.token, intentSignal);
+                if (!isProviderIntentCurrent(intentGeneration)) return;
                 window.dispatchEvent(new CustomEvent("steward-token-sync"));
               }
               setExternalSuccessDestination(resolveLoginReturnTo(searchParams));
@@ -1145,7 +1384,7 @@ export default function StewardLoginSection() {
           } catch (sessionError) {
             // error-policy:J4 a consumed challenge without a recoverable shared
             // session remains visibly nonterminal and offers resend recovery.
-            if (!cancelled) {
+            if (!cancelled && isProviderIntentCurrent(intentGeneration)) {
               setEmailCheckState("approved");
               setError(
                 getErrorMessage(
@@ -1160,7 +1399,7 @@ export default function StewardLoginSection() {
         setEmailCheckState(mapped);
         if (mapped !== "pending") return;
       } catch (pollError) {
-        if (!cancelled) {
+        if (!cancelled && isProviderIntentCurrent(intentGeneration)) {
           setError(
             describeEmailLoginError(
               pollError,
@@ -1169,7 +1408,7 @@ export default function StewardLoginSection() {
           );
         }
       }
-      if (!cancelled) {
+      if (!cancelled && isProviderIntentCurrent(intentGeneration)) {
         timer = setTimeout(poll, EMAIL_STATUS_POLL_MS);
       }
     };
@@ -1182,6 +1421,9 @@ export default function StewardLoginSection() {
   }, [
     emailChallenge,
     emailCheckState,
+    isProviderIntentCurrent,
+    loading,
+    providerIntentRevision,
     recoverSharedEmailSession,
     searchParams,
     step,
@@ -1189,13 +1431,15 @@ export default function StewardLoginSection() {
   ]);
 
   useEffect(() => {
-    if (step !== "email-sent" || !email.trim()) return;
+    if (step !== "email-sent" || loading === "email" || !email.trim()) return;
+    const intentGeneration = providerIntentRevision;
+    const intentSignal = providerIntentAbortRef.current.signal;
     let cancelled = false;
     const unsubscribe = subscribeStewardEmailLoginComplete(email, (message) => {
       void (async () => {
         try {
           const recovered = await recoverSharedEmailSession();
-          if (cancelled) return;
+          if (cancelled || !isProviderIntentCurrent(intentGeneration)) return;
           if (!recovered) {
             setEmailCheckState("approved");
             setError(
@@ -1204,7 +1448,8 @@ export default function StewardLoginSection() {
             return;
           }
           if (recovered.token) {
-            await persistStewardToken(recovered.token);
+            await persistStewardToken(recovered.token, intentSignal);
+            if (!isProviderIntentCurrent(intentGeneration)) return;
             window.dispatchEvent(new CustomEvent("steward-token-sync"));
           }
           setExternalSuccessDestination(message.destination);
@@ -1214,7 +1459,7 @@ export default function StewardLoginSection() {
         } catch (sessionError) {
           // error-policy:J4 the advisory signal cannot create a signed-in UI;
           // failed authoritative recovery stays visible with resend available.
-          if (!cancelled) {
+          if (!cancelled && isProviderIntentCurrent(intentGeneration)) {
             setEmailCheckState("approved");
             setError(
               getErrorMessage(
@@ -1230,7 +1475,14 @@ export default function StewardLoginSection() {
       cancelled = true;
       unsubscribe();
     };
-  }, [email, recoverSharedEmailSession, step]);
+  }, [
+    email,
+    isProviderIntentCurrent,
+    loading,
+    providerIntentRevision,
+    recoverSharedEmailSession,
+    step,
+  ]);
 
   useEffect(() => {
     const tracksEmailExpiry = step === "email-sent" && emailChallenge !== null;
@@ -1261,28 +1513,45 @@ export default function StewardLoginSection() {
   async function handleSuccess(
     token: string,
     refreshToken?: string | null,
+    intentGeneration = providerIntentGenerationRef.current,
     options?: { verifiedPhone: string },
   ) {
+    if (!isProviderIntentCurrent(intentGeneration)) return;
+    const intentSignal = providerIntentAbortRef.current.signal;
+    sessionCommitGenerationRef.current = intentGeneration;
+    setSessionCommitGeneration(intentGeneration);
     setPasskeyEmailGrant(null);
     setShowPasskeyEnrollmentRecovery(false);
-    if (options) {
-      await syncStewardSessionCookie(token, refreshToken, options);
-    } else {
-      await syncStewardSessionCookie(token, refreshToken);
+    try {
+      await syncStewardSessionCookie(token, refreshToken, {
+        ...options,
+        signal: intentSignal,
+      });
+      if (!isProviderIntentCurrent(intentGeneration)) return;
+      // Publish the browser token only after the authoritative Cloud sync wins.
+      // Otherwise StewardProviderRuntime can race a second unhinted sync against
+      // phone-account promotion.
+      await persistStewardToken(token, intentSignal);
+      if (!isProviderIntentCurrent(intentGeneration)) return;
+      toast.success("Signed in!");
+      setRedirectTo(
+        resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
+      );
+      setStep("success");
+    } catch (commitError) {
+      if (isProviderGenerationCurrent(intentGeneration)) {
+        sessionCommitGenerationRef.current = null;
+        setSessionCommitGeneration(null);
+      }
+      throw commitError;
     }
-    // Publish the browser token only after the authoritative Cloud sync wins.
-    // Otherwise StewardProviderRuntime can race a second unhinted sync against
-    // phone-account promotion.
-    await persistStewardToken(token);
-    toast.success("Signed in!");
-    setRedirectTo(
-      resolveLoginReturnTo(searchParams, consumePendingOAuthReturnTo()),
-    );
-    setStep("success");
   }
 
   async function handleLocalDedicatedSignIn() {
-    if (!LOCAL_DEDICATED_TEST_API_KEY) return;
+    if (!LOCAL_DEDICATED_TEST_API_KEY || !providersLiveConfirmedRef.current) {
+      return;
+    }
+    const { generation, signal } = rotateProviderIntent();
     setLoading("local");
     setError(null);
     try {
@@ -1293,12 +1562,14 @@ export default function StewardLoginSection() {
       const response = await fetch(localSessionUrl, {
         method: "POST",
         credentials: "include",
+        signal,
         headers: {
           Authorization: `Bearer ${LOCAL_DEDICATED_TEST_API_KEY}`,
           "Content-Type": "application/json",
         },
       });
       const result = parseLocalTestSessionResponse(await response.text());
+      if (!isProviderIntentCurrent(generation)) return;
       if (!response.ok || !result.token) {
         throw new Error(
           result.error ?? "Could not start the local Cloud test session.",
@@ -1309,11 +1580,13 @@ export default function StewardLoginSection() {
       // so this dev-only path must plant the readable marker itself.
       // biome-ignore lint/suspicious/noDocumentCookie: the marker must be readable synchronously by the session hook; the Cookie Store API is async and not universally available.
       document.cookie = "eliza-test-auth=1; Path=/; SameSite=Lax; Max-Age=3600";
-      await persistStewardToken(LOCAL_DEDICATED_TEST_API_KEY);
+      await persistStewardToken(LOCAL_DEDICATED_TEST_API_KEY, signal);
+      if (!isProviderIntentCurrent(generation)) return;
       window.dispatchEvent(new CustomEvent("steward-token-sync"));
       setRedirectTo(resolveLoginReturnTo(searchParams));
       setStep("success");
     } catch (localSignInError) {
+      if (!isProviderIntentCurrent(generation)) return;
       setError(
         getErrorMessage(
           localSignInError,
@@ -1321,7 +1594,7 @@ export default function StewardLoginSection() {
         ),
       );
     } finally {
-      setLoading(null);
+      if (isProviderIntentCurrent(generation)) setLoading(null);
     }
   }
 
@@ -1402,7 +1675,13 @@ export default function StewardLoginSection() {
     return true;
   }
 
-  async function runScopedPasskeyLogin() {
+  async function runScopedPasskeyLogin(intentGeneration: number) {
+    if (
+      !isProviderIntentCurrent(intentGeneration) ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
     setLoading("passkey");
     setError(null);
     setShowPasskeyRecovery(false);
@@ -1413,9 +1692,12 @@ export default function StewardLoginSection() {
           fallbackToRegistration: false,
         }),
       );
+      if (!isProviderIntentCurrent(intentGeneration)) return;
       await rememberPasskeyDeviceHint(email);
-      await handleSuccess(result.token, result.refreshToken);
+      if (!isProviderIntentCurrent(intentGeneration)) return;
+      await handleSuccess(result.token, result.refreshToken, intentGeneration);
     } catch (e: unknown) {
+      if (!isProviderIntentCurrent(intentGeneration)) return;
       // error-policy:J4 authentication failures remain visibly distinct and
       // only the ambiguous browser-owned credential outcome offers recovery.
       if (isUserVerificationError(e)) {
@@ -1436,31 +1718,53 @@ export default function StewardLoginSection() {
   }
 
   async function handlePasskey() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
     if (!validatePasskeyIntent()) return;
+    const { generation } = rotateProviderIntent();
     setLoading("passkey");
     setError(null);
     setShowPasskeyRecovery(false);
 
     const hinted = await hasPasskeyDeviceHint(email);
+    if (!isProviderIntentCurrent(generation)) return;
     if (!hinted) {
       // A new device-local email goes straight to verified enrollment. This
       // decision never asks Steward whether an account or passkey exists.
-      await startPasskeySignup();
+      await startPasskeySignup(generation);
       return;
     }
-    await runScopedPasskeyLogin();
+    await runScopedPasskeyLogin(generation);
   }
 
   async function handleExistingPasskey() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
     if (!validatePasskeyIntent()) return;
-    await runScopedPasskeyLogin();
+    const { generation } = rotateProviderIntent();
+    await runScopedPasskeyLogin(generation);
   }
 
-  async function startPasskeySignup() {
+  async function startPasskeySignup(intentGeneration: number) {
+    if (
+      !isProviderIntentCurrent(intentGeneration) ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
     setLoading("passkey");
     setError(null);
     try {
       await auth.sendEmailOtp(email.trim());
+      if (!isProviderIntentCurrent(intentGeneration)) return;
       setPasskeyEmailGrant(null);
       setShowPasskeyEnrollmentRecovery(false);
       setOtpCode("");
@@ -1468,17 +1772,36 @@ export default function StewardLoginSection() {
       setStep("otp-entry");
       setLoading(null);
     } catch (e: unknown) {
+      if (!isProviderIntentCurrent(intentGeneration)) return;
       setError(getErrorMessage(e, "Couldn't send your code. Try again."));
       setLoading(null);
     }
   }
 
+  function handleStartPasskeySignup() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
+    const { generation } = rotateProviderIntent();
+    void startPasskeySignup(generation);
+  }
+
   async function handleVerifyOtpAndRegister() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
     const code = otpCode.trim();
     if (code.length < 4) {
       setError("Enter the code from your email");
       return;
     }
+    const { generation } = rotateProviderIntent();
     setLoading("passkey");
     setError(null);
     setShowPasskeyEnrollmentRecovery(false);
@@ -1486,24 +1809,29 @@ export default function StewardLoginSection() {
       let emailGrant = passkeyEmailGrant;
       if (!emailGrant) {
         ({ emailGrant } = await auth.verifyEmailOtp(email.trim(), code));
+        if (!isProviderIntentCurrent(generation)) return;
         setPasskeyEmailGrant(emailGrant);
       }
       const result = requireCompletedAuth(
         await auth.addPasskey(email.trim(), { emailGrant }),
       );
+      if (!isProviderIntentCurrent(generation)) return;
       await rememberPasskeyDeviceHint(email);
-      await handleSuccess(result.token, result.refreshToken);
+      if (!isProviderIntentCurrent(generation)) return;
+      await handleSuccess(result.token, result.refreshToken, generation);
     } catch (e: unknown) {
+      if (!isProviderIntentCurrent(generation)) return;
       // error-policy:J4 an OTP-proven account with a persisted credential
       // recovers through authentication; ambiguous browser cancellation keeps
       // registration retry plus explicit alternate sign-in choices visible.
       if (isPasskeyAlreadyRegistered(e)) {
         await rememberPasskeyDeviceHint(email);
+        if (!isProviderIntentCurrent(generation)) return;
         setPasskeyEmailGrant(null);
         setOtpCode("");
         setShowPasskeyEnrollmentRecovery(false);
         setStep("idle");
-        await runScopedPasskeyLogin();
+        await runScopedPasskeyLogin(generation);
         return;
       }
       if (isUserCancelled(e)) {
@@ -1517,18 +1845,32 @@ export default function StewardLoginSection() {
   }
 
   async function handleEnrollmentExistingPasskey() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.passkey !== true
+    ) {
+      return;
+    }
+    const { generation } = rotateProviderIntent();
     setPasskeyEmailGrant(null);
     setOtpCode("");
     setShowPasskeyEnrollmentRecovery(false);
     setStep("idle");
-    await runScopedPasskeyLogin();
+    await runScopedPasskeyLogin(generation);
   }
 
   async function handleEmail() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.email !== true
+    ) {
+      return;
+    }
     if (!email.trim()) {
       setError("Enter your email");
       return;
     }
+    const { generation } = rotateProviderIntent();
     setLoading("email");
     setError(null);
     setPasskeyEmailGrant(null);
@@ -1542,6 +1884,7 @@ export default function StewardLoginSection() {
         { baseUrl: stewardApiUrl, tenantId: STEWARD_TENANT_ID },
         email.trim(),
       );
+      if (!isProviderIntentCurrent(generation)) return;
       setEmailChallenge(challenge);
       setEmailCode("");
       setShowUndeclaredCodeEntry(false);
@@ -1550,12 +1893,19 @@ export default function StewardLoginSection() {
       setStep("email-sent");
       setLoading(null);
     } catch (e: unknown) {
+      if (!isProviderIntentCurrent(generation)) return;
       setError(describeEmailLoginError(e, "Failed to send sign-in email."));
       setLoading(null);
     }
   }
 
   async function handleSendSms() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.sms !== true
+    ) {
+      return;
+    }
     const normalizedPhone = normalizePhoneForCountry(phone, phoneCountry);
     if (!normalizedPhone) {
       const selectedCountry = PHONE_COUNTRY_OPTIONS.find(
@@ -1571,60 +1921,83 @@ export default function StewardLoginSection() {
       return;
     }
 
+    const { generation } = rotateProviderIntent();
     setLoading("sms");
     setError(null);
     try {
       await auth.sendSmsOtp(normalizedPhone);
+      if (!isProviderIntentCurrent(generation)) return;
       setPhone(normalizedPhone);
       setSmsCode("");
       setResendAvailableAt(Date.now() + AUTH_CODE_RESEND_COOLDOWN_MS);
       setResendRemainingSeconds(AUTH_CODE_RESEND_COOLDOWN_MS / 1000);
       setStep("sms-code");
     } catch (smsError) {
+      if (!isProviderIntentCurrent(generation)) return;
       // error-policy:J4 Steward transport failures remain a visible login error.
       setError(
         getErrorMessage(smsError, "Couldn't send a text code. Try again."),
       );
     } finally {
-      setLoading(null);
+      if (isProviderIntentCurrent(generation)) setLoading(null);
     }
   }
 
   async function handleVerifySms() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.sms !== true
+    ) {
+      return;
+    }
     const code = sanitizeOneTimeCode(smsCode);
     if (code.length !== 6) {
       setError("Enter the six-digit code from the text message.");
       return;
     }
 
+    const { generation } = rotateProviderIntent();
     setLoading("sms");
     setError(null);
     try {
       const result = requireCompletedAuth(await auth.verifySmsOtp(phone, code));
-      await handleSuccess(result.token, result.refreshToken, {
+      if (!isProviderIntentCurrent(generation)) return;
+      await handleSuccess(result.token, result.refreshToken, generation, {
         verifiedPhone: phone,
       });
     } catch (smsError) {
+      if (!isProviderIntentCurrent(generation)) return;
       // error-policy:J4 Rejected or failed SMS verification stays recoverable.
       setError(getErrorMessage(smsError, "That code didn't work. Try again."));
     } finally {
-      setLoading(null);
+      if (isProviderIntentCurrent(generation)) setLoading(null);
     }
   }
 
   function cancelSmsLogin() {
+    if (sessionCommitGenerationRef.current !== null) return;
+    rotateProviderIntent();
     setStep("idle");
     setSmsCode("");
     setError(null);
     setLoading(null);
+    setResendAvailableAt(0);
+    setResendRemainingSeconds(0);
   }
 
   async function handleVerifyEmailCode() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.email !== true
+    ) {
+      return;
+    }
     const code = sanitizeOneTimeCode(emailCode);
     if (code.length !== 6) {
       setError("Enter the six-digit code from your email.");
       return;
     }
+    const { generation } = rotateProviderIntent();
     setLoading("email");
     setError(null);
     try {
@@ -1638,8 +2011,10 @@ export default function StewardLoginSection() {
           "Additional verification is required to finish signing in.",
         );
       }
-      await handleSuccess(result.token, result.refreshToken);
+      if (!isProviderIntentCurrent(generation)) return;
+      await handleSuccess(result.token, result.refreshToken, generation);
     } catch (e: unknown) {
+      if (!isProviderIntentCurrent(generation)) return;
       setError(
         describeEmailLoginError(e, "That code did not work. Try again."),
       );
@@ -1648,6 +2023,8 @@ export default function StewardLoginSection() {
   }
 
   function cancelEmailLogin() {
+    if (sessionCommitGenerationRef.current !== null) return;
+    rotateProviderIntent();
     setStep("idle");
     setEmailChallenge(null);
     setEmailCode("");
@@ -1655,10 +2032,20 @@ export default function StewardLoginSection() {
     setEmailCheckState("pending");
     setError(null);
     setLoading(null);
+    setResendAvailableAt(0);
+    setResendRemainingSeconds(0);
   }
 
   const handleOAuth = useCallback(
     async (provider: StewardOAuthProvider) => {
+      if (
+        !providersLiveConfirmedRef.current ||
+        providersRef.current === null ||
+        !isStewardOAuthProviderEnabled(providersRef.current, provider)
+      ) {
+        return;
+      }
+      const { generation } = rotateProviderIntent();
       if (Capacitor.isNativePlatform()) {
         // Keep the provider's PKCE verifier, OAuth state, and pending outer
         // mobile-auth return path in one browser storage authority. Starting
@@ -1670,10 +2057,12 @@ export default function StewardLoginSection() {
           const browserLoginUrl = new URL(window.location.href);
           browserLoginUrl.searchParams.set("nativeProvider", provider);
           const opened = await openExternalUrl(browserLoginUrl.toString());
+          if (!isProviderIntentCurrent(generation)) return;
           if (!opened) {
             setError("Could not open the secure sign-in window. Try again.");
           }
         } catch (launchError: unknown) {
+          if (!isProviderIntentCurrent(generation)) return;
           setError(
             getErrorMessage(
               launchError,
@@ -1681,7 +2070,7 @@ export default function StewardLoginSection() {
             ),
           );
         } finally {
-          setLoading(null);
+          if (isProviderIntentCurrent(generation)) setLoading(null);
         }
         return;
       }
@@ -1701,6 +2090,7 @@ export default function StewardLoginSection() {
       let state: string;
       try {
         const pkce = await createStewardPkcePair();
+        if (!isProviderIntentCurrent(generation)) return;
         state = generateStewardOAuthState();
         // Verifier and state are stashed together: the callback requires the
         // `?state=` echo to match AND the verifier to survive, so a harvested
@@ -1714,6 +2104,7 @@ export default function StewardLoginSection() {
         }
         codeChallenge = pkce.challenge;
       } catch (e: unknown) {
+        if (!isProviderIntentCurrent(generation)) return;
         setError(getErrorMessage(e, "Could not start sign-in"));
         setLoading(null);
         return;
@@ -1731,7 +2122,12 @@ export default function StewardLoginSection() {
       );
       window.location.href = authorizeUrl;
     },
-    [searchParams, stewardApiUrl],
+    [
+      isProviderIntentCurrent,
+      rotateProviderIntent,
+      searchParams,
+      stewardApiUrl,
+    ],
   );
 
   useEffect(() => {
@@ -1741,7 +2137,7 @@ export default function StewardLoginSection() {
     const requestedProvider = new URLSearchParams(window.location.search).get(
       "nativeProvider",
     );
-    if (!requestedProvider || !providersLoaded) return;
+    if (!requestedProvider || !providersLiveConfirmed) return;
 
     // Consume the marker before starting any async work so reloads, provider
     // failures, and back/forward restoration cannot auto-launch repeatedly.
@@ -1759,19 +2155,47 @@ export default function StewardLoginSection() {
     );
     if (!provider) return;
     void handleOAuth(provider);
-  }, [enabledOAuthProviders, handleOAuth, providersLoaded]);
+  }, [enabledOAuthProviders, handleOAuth, providersLiveConfirmed]);
 
-  function handleTelegramError(message: string) {
+  function handleTelegramIntent() {
+    if (
+      !providersLiveConfirmedRef.current ||
+      providersRef.current?.telegram !== true ||
+      !telegramBotUsername
+    ) {
+      return;
+    }
+    const { generation } = rotateProviderIntent();
+    setError(null);
+    setTelegramIntentGeneration(generation);
+    setTelegramIntent(true);
+  }
+
+  function handleTelegramError(message: string, intentGeneration: number) {
+    if (!isProviderIntentCurrent(intentGeneration)) return;
+    const { generation } = rotateProviderIntent();
     setError(message);
     setLoading(null);
     setTelegramIntent(false);
-    window.setTimeout(
-      () => telegramIntentButtonRef.current?.focus({ preventScroll: true }),
-      0,
-    );
+    setTelegramIntentGeneration(null);
+    window.setTimeout(() => {
+      if (isProviderIntentCurrent(generation)) {
+        telegramIntentButtonRef.current?.focus({ preventScroll: true });
+      }
+    }, 0);
   }
 
-  async function handleTelegramAuth(payload: StewardTelegramLoginPayload) {
+  async function handleTelegramAuth(
+    payload: StewardTelegramLoginPayload,
+    intentGeneration: number,
+  ) {
+    if (
+      !isProviderIntentCurrent(intentGeneration) ||
+      providersRef.current?.telegram !== true ||
+      !telegramBotUsername
+    ) {
+      return;
+    }
     setLoading("telegram");
     setError(null);
     try {
@@ -1780,27 +2204,60 @@ export default function StewardLoginSection() {
           tenantId: STEWARD_TENANT_ID,
         }),
       );
-      await handleSuccess(result.token, result.refreshToken);
+      if (!isProviderIntentCurrent(intentGeneration)) return;
+      await handleSuccess(result.token, result.refreshToken, intentGeneration);
     } catch (telegramError: unknown) {
+      if (!isProviderIntentCurrent(intentGeneration)) return;
       // error-policy:J4 Steward or Cloud session failures remain visibly
       // distinct and leave the user on the login surface for a safe retry.
       setError(
         getErrorMessage(telegramError, "Telegram sign-in failed. Try again."),
       );
       setLoading(null);
-      window.setTimeout(
-        () => telegramRegionRef.current?.focus({ preventScroll: true }),
-        0,
-      );
+      window.setTimeout(() => {
+        if (isProviderIntentCurrent(intentGeneration)) {
+          telegramRegionRef.current?.focus({ preventScroll: true });
+        }
+      }, 0);
     }
   }
 
   // First wallet click: mount the lazy wallet stack and remember which chain
   // to auto-start once it's up, so the user doesn't have to click twice.
   function handleWalletIntent(kind: WalletKind) {
+    const currentProviders = providersRef.current;
+    if (
+      !providersLiveConfirmedRef.current ||
+      currentProviders === null ||
+      (kind === "ethereum"
+        ? currentProviders.siwe !== true
+        : currentProviders.siws !== true)
+    ) {
+      return;
+    }
+    const { generation } = rotateProviderIntent();
     setError(null);
+    setWalletIntentGeneration(generation);
+    setMountedWalletKind(kind);
     setWalletButtonsMounted(true);
     setAutoStartWallet(kind);
+  }
+
+  function cancelWalletIntent() {
+    if (sessionCommitGenerationRef.current !== null) return;
+    rotateProviderIntent();
+    setWalletButtonsMounted(false);
+    setMountedWalletKind(null);
+    setAutoStartWallet(null);
+    setWalletIntentGeneration(null);
+    setLoading(null);
+    setError(null);
+    setShowWalletOptions(true);
+    window.setTimeout(() => {
+      walletOptionsRegionRef.current
+        ?.querySelector<HTMLButtonElement>("button:not([disabled])")
+        ?.focus({ preventScroll: true });
+    }, 0);
   }
 
   // Distinct post-intent lock state: the disclosure toggle becomes disabled
@@ -1859,7 +2316,8 @@ export default function StewardLoginSection() {
   }
 
   if (step === "sms-code") {
-    const resendDisabled = loading !== null || resendRemainingSeconds > 0;
+    const resendDisabled =
+      providerActionsDisabled || resendRemainingSeconds > 0;
 
     return (
       <div className="space-y-4 py-4 text-center">
@@ -1913,7 +2371,7 @@ export default function StewardLoginSection() {
             onKeyDown={(event) => {
               if (event.key === "Enter") handleVerifySms();
             }}
-            disabled={loading !== null}
+            disabled={providerActionsDisabled}
             className="hosted-signin-focus-emphasis"
           />
         </div>
@@ -1922,7 +2380,7 @@ export default function StewardLoginSection() {
           variant="default"
           type="button"
           onClick={handleVerifySms}
-          disabled={loading !== null || smsCode.length !== 6}
+          disabled={providerActionsDisabled || smsCode.length !== 6}
           className="hosted-signin-focus-emphasis w-full"
         >
           {loading === "sms" ? (
@@ -1954,6 +2412,7 @@ export default function StewardLoginSection() {
             type="button"
             className="hosted-signin-focus-emphasis"
             onClick={cancelSmsLogin}
+            disabled={sessionCommitGeneration !== null}
           >
             {t("cloud.login.backToLogin", { defaultValue: "Back to login" })}
           </Button>
@@ -2018,7 +2477,8 @@ export default function StewardLoginSection() {
     const showCodeEntry =
       codeEntryMode === "asserted" ||
       (codeEntryMode === "undeclared" && showUndeclaredCodeEntry);
-    const resendDisabled = loading !== null || resendRemainingSeconds > 0;
+    const resendDisabled =
+      providerActionsDisabled || resendRemainingSeconds > 0;
     const checkEmailTitle =
       emailCheckState === "approved"
         ? "Link approved"
@@ -2107,7 +2567,9 @@ export default function StewardLoginSection() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleVerifyEmailCode();
               }}
-              disabled={loading !== null || emailCheckState !== "pending"}
+              disabled={
+                providerActionsDisabled || emailCheckState !== "pending"
+              }
             />
             <p
               id="email-sign-in-code-hint"
@@ -2127,7 +2589,7 @@ export default function StewardLoginSection() {
             type="button"
             onClick={handleVerifyEmailCode}
             disabled={
-              loading !== null ||
+              providerActionsDisabled ||
               emailCode.length !== 6 ||
               emailCheckState !== "pending"
             }
@@ -2179,6 +2641,7 @@ export default function StewardLoginSection() {
           type="button"
           className=""
           onClick={cancelEmailLogin}
+          disabled={sessionCommitGeneration !== null}
         >
           {t("cloud.login.backToLogin", { defaultValue: "Back to login" })}
         </Button>
@@ -2226,14 +2689,14 @@ export default function StewardLoginSection() {
           onKeyDown={(e) => {
             if (e.key === "Enter") handleVerifyOtpAndRegister();
           }}
-          disabled={loading !== null}
+          disabled={providerActionsDisabled}
         />
 
         <Button
           variant="default"
           type="button"
           onClick={handleVerifyOtpAndRegister}
-          disabled={loading !== null || otpCode.trim().length < 4}
+          disabled={providerActionsDisabled || otpCode.trim().length < 4}
           className="w-full"
         >
           {loading === "passkey" ? <Spinner /> : <PasskeyIcon />}{" "}
@@ -2260,7 +2723,7 @@ export default function StewardLoginSection() {
                 variant="outlineMuted"
                 type="button"
                 onClick={handleEnrollmentExistingPasskey}
-                disabled={loading !== null}
+                disabled={providerActionsDisabled}
                 className=""
               >
                 {t("cloud.login.button.existingPasskey", {
@@ -2272,7 +2735,7 @@ export default function StewardLoginSection() {
                   variant="outlineMuted"
                   type="button"
                   onClick={handleEmail}
-                  disabled={loading !== null}
+                  disabled={providerActionsDisabled}
                   className=""
                 >
                   {t("cloud.login.passkeyRecovery.magicLink", {
@@ -2290,6 +2753,8 @@ export default function StewardLoginSection() {
             type="button"
             className=""
             onClick={() => {
+              if (sessionCommitGenerationRef.current !== null) return;
+              rotateProviderIntent();
               setStep("idle");
               setOtpCode("");
               setPasskeyEmailGrant(null);
@@ -2297,6 +2762,7 @@ export default function StewardLoginSection() {
               setError(null);
               setLoading(null);
             }}
+            disabled={sessionCommitGeneration !== null}
           >
             ← {t("cloud.login.back", { defaultValue: "Back" })}
           </Button>
@@ -2304,8 +2770,8 @@ export default function StewardLoginSection() {
             variant="ghostMuted"
             type="button"
             className=""
-            disabled={loading !== null}
-            onClick={startPasskeySignup}
+            disabled={providerActionsDisabled}
+            onClick={handleStartPasskeySignup}
           >
             {t("cloud.login.otp.resend", { defaultValue: "Resend code" })}
           </Button>
@@ -2350,7 +2816,11 @@ export default function StewardLoginSection() {
   // Provider discovery in flight: a pulsing skeleton with the final option
   // stack's exact geometry, so the real options materialize in place with no
   // card resize (#18256) instead of replacing a short spinner block.
-  if (!providersLoaded || !sessionRecoveryComplete) {
+  if (
+    !providersLoaded ||
+    !sessionRecoveryComplete ||
+    providerLayoutAwaitingLiveAuthority
+  ) {
     return (
       <div
         role="status"
@@ -2369,14 +2839,17 @@ export default function StewardLoginSection() {
     );
   }
 
-  // A fresh browser — or a wallet-only cached tenant whose wallets cannot be
-  // activated without live confirmation — has no usable provider set when
-  // discovery fails. Fail visibly with a retry rather than rendering an empty
-  // email shell. Mixed cached tenants keep their non-wallet methods below and
-  // receive the non-destructive retry warning in the normal form.
+  const noUsableProvider =
+    providersLiveConfirmed && !passkeyProbePending && !hasUsableMethod;
+
+  // A fresh browser, a cached tenant with no currently authorized method, or
+  // an authoritative all-disabled response must fail visibly with a retry
+  // rather than rendering an inert email shell. Mixed cached tenants retain
+  // their layout below, but every action stays disabled until live discovery.
   if (
     providers === null ||
-    (providerDiscoveryError !== null && !hasUsableNonWalletProvider)
+    (providerDiscoveryError !== null && !hasUsableMethod) ||
+    noUsableProvider
   ) {
     return (
       <ReservedLoginFrame>
@@ -2389,13 +2862,22 @@ export default function StewardLoginSection() {
           </div>
           <div className="space-y-1">
             <p className="text-base font-semibold text-txt-strong">
-              {t("cloud.login.providerDiscovery.title", {
-                defaultValue: "Sign-in options couldn't load",
-              })}
+              {noUsableProvider
+                ? t("cloud.login.providerDiscovery.noMethodsTitle", {
+                    defaultValue: "No sign-in methods are available",
+                  })
+                : t("cloud.login.providerDiscovery.title", {
+                    defaultValue: "Sign-in options couldn't load",
+                  })}
             </p>
             <p className="text-sm text-muted">
-              {providerDiscoveryError ??
-                "Steward returned no authoritative sign-in options."}
+              {noUsableProvider
+                ? t("cloud.login.providerDiscovery.noMethodsMessage", {
+                    defaultValue:
+                      "This deployment did not advertise a sign-in method this browser can use.",
+                  })
+                : (providerDiscoveryError ??
+                  "Steward returned no authoritative sign-in options.")}
             </p>
             <p className="text-xs leading-relaxed text-muted">
               {t("cloud.login.providerDiscovery.message", {
@@ -2490,7 +2972,7 @@ export default function StewardLoginSection() {
                 name="phone-country"
                 value={phoneCountry}
                 onValueChange={(value) => setPhoneCountry(value as CountryCode)}
-                disabled={isLoading}
+                disabled={providerActionsDisabled}
               >
                 <SelectTrigger
                   aria-label={t("cloud.login.phoneCountryLabel", {
@@ -2536,7 +3018,7 @@ export default function StewardLoginSection() {
                 onKeyDown={(event) => {
                   if (event.key === "Enter") handleSendSms();
                 }}
-                disabled={isLoading}
+                disabled={providerActionsDisabled}
                 className="hosted-signin-focus-emphasis flex-1"
               />
             </div>
@@ -2545,7 +3027,7 @@ export default function StewardLoginSection() {
             variant="default"
             type="button"
             onClick={handleSendSms}
-            disabled={isLoading}
+            disabled={providerActionsDisabled}
             className="hosted-signin-focus-emphasis w-full"
           >
             {loading === "sms" ? (
@@ -2567,83 +3049,89 @@ export default function StewardLoginSection() {
         </>
       )}
 
-      <div className="space-y-2">
-        <label
-          htmlFor="steward-login-email"
-          className="block text-center text-sm font-medium text-txt"
-        >
-          {t("cloud.login.emailLabel", { defaultValue: "Email" })}
-        </label>
-        <Input
-          variant="form"
-          density="relaxed"
-          ref={emailInputRef}
-          id="steward-login-email"
-          type="email"
-          name="email"
-          placeholder={t("cloud.login.emailPlaceholder", {
-            defaultValue: "you@example.com",
-          })}
-          value={email}
-          onChange={(e) => {
-            setEmail(e.target.value);
-            setPasskeyEmailGrant(null);
-            setShowPasskeyEnrollmentRecovery(false);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              if (showPasskey) {
-                handlePasskey();
-              } else if (providers.email !== false) {
-                handleEmail();
-              }
-            }
-          }}
-          disabled={isLoading}
-          className="hosted-signin-focus-emphasis"
-          // Do NOT add the "webauthn" autocomplete token here. It arms browser
-          // conditional-mediation passkey autofill, which prompts for an
-          // EXISTING account's discoverable credential the moment a brand-new
-          // email is typed, hijacking signup. The explicit Passkey button below
-          // still offers email-scoped passkey sign-in via handlePasskey().
-          // Port of Steward PR #690.
-          autoComplete="email"
-        />
-      </div>
+      {showEmailEntry && (
+        <>
+          <div className="space-y-2">
+            <label
+              htmlFor="steward-login-email"
+              className="block text-center text-sm font-medium text-txt"
+            >
+              {t("cloud.login.emailLabel", { defaultValue: "Email" })}
+            </label>
+            <Input
+              variant="form"
+              density="relaxed"
+              ref={emailInputRef}
+              id="steward-login-email"
+              type="email"
+              name="email"
+              placeholder={t("cloud.login.emailPlaceholder", {
+                defaultValue: "you@example.com",
+              })}
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                setPasskeyEmailGrant(null);
+                setShowPasskeyEnrollmentRecovery(false);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (showPasskey) {
+                    handlePasskey();
+                  } else if (emailEnabled) {
+                    handleEmail();
+                  }
+                }
+              }}
+              disabled={providerActionsDisabled}
+              className="hosted-signin-focus-emphasis"
+              // Do NOT add the "webauthn" autocomplete token here. It arms browser
+              // conditional-mediation passkey autofill, which prompts for an
+              // EXISTING account's discoverable credential the moment a brand-new
+              // email is typed, hijacking signup. The explicit Passkey button below
+              // still offers email-scoped passkey sign-in via handlePasskey().
+              // Port of Steward PR #690.
+              autoComplete="email"
+            />
+          </div>
 
-      <div className="flex gap-2">
-        {showPasskey && (
-          <Button
-            variant="default"
-            type="button"
-            onClick={handlePasskey}
-            disabled={isLoading}
-            className="flex-1"
-          >
-            {loading === "passkey" ? <Spinner /> : <PasskeyIcon />}{" "}
-            {t("cloud.login.button.passkey", { defaultValue: "Passkey" })}
-          </Button>
-        )}
-        {providers.email !== false && (
-          <Button
-            variant="outlineMuted"
-            type="button"
-            onClick={handleEmail}
-            disabled={isLoading}
-            className="hosted-signin-focus-emphasis flex-1"
-          >
-            {loading === "email" ? <Spinner /> : <EmailIcon />}{" "}
-            {t("cloud.login.button.magicLink", { defaultValue: "Magic Link" })}
-          </Button>
-        )}
-      </div>
+          <div className="flex gap-2">
+            {showPasskey && (
+              <Button
+                variant="default"
+                type="button"
+                onClick={handlePasskey}
+                disabled={providerActionsDisabled}
+                className="flex-1"
+              >
+                {loading === "passkey" ? <Spinner /> : <PasskeyIcon />}{" "}
+                {t("cloud.login.button.passkey", { defaultValue: "Passkey" })}
+              </Button>
+            )}
+            {emailEnabled && (
+              <Button
+                variant="outlineMuted"
+                type="button"
+                onClick={handleEmail}
+                disabled={providerActionsDisabled}
+                className="hosted-signin-focus-emphasis flex-1"
+              >
+                {loading === "email" ? <Spinner /> : <EmailIcon />}{" "}
+                {t("cloud.login.button.magicLink", {
+                  defaultValue: "Magic Link",
+                })}
+              </Button>
+            )}
+          </div>
+        </>
+      )}
 
       {showPasskey && (
         <Button
           variant="ghostMuted"
           type="button"
           onClick={handleExistingPasskey}
-          disabled={isLoading}
+          disabled={providerActionsDisabled}
           className="hosted-signin-focus-emphasis w-full"
         >
           {t("cloud.login.button.existingPasskey", {
@@ -2652,9 +3140,7 @@ export default function StewardLoginSection() {
         </Button>
       )}
 
-      {!showPasskey &&
-      providers.passkey !== false &&
-      passkeyCapability === null ? (
+      {passkeyProbePending ? (
         <p className="text-center text-xs text-muted" role="status">
           {t("cloud.login.checkingPasskey", {
             defaultValue:
@@ -2685,12 +3171,12 @@ export default function StewardLoginSection() {
             </p>
           </div>
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {providers.email !== false && (
+            {emailEnabled && (
               <Button
                 variant="outlineMuted"
                 type="button"
                 onClick={handleEmail}
-                disabled={isLoading}
+                disabled={providerActionsDisabled}
                 className="hosted-signin-focus-emphasis"
               >
                 {t("cloud.login.passkeyRecovery.magicLink", {
@@ -2700,8 +3186,8 @@ export default function StewardLoginSection() {
             )}
             <Button
               type="button"
-              onClick={startPasskeySignup}
-              disabled={isLoading}
+              onClick={handleStartPasskeySignup}
+              disabled={providerActionsDisabled}
               className="hosted-signin-focus-emphasis"
             >
               {t("cloud.login.passkeyRecovery.setup", {
@@ -2726,7 +3212,7 @@ export default function StewardLoginSection() {
               type="button"
               aria-label={stewardOAuthProviderLabel(provider)}
               onClick={() => handleOAuth(provider)}
-              disabled={isLoading}
+              disabled={providerActionsDisabled}
               className="hosted-signin-focus-emphasis"
             >
               {loading === provider ? (
@@ -2739,18 +3225,15 @@ export default function StewardLoginSection() {
                 : ` ${stewardOAuthProviderLabel(provider)}`}
             </Button>
           ))}
-          {providers.telegram && (
+          {telegramRenderable && (
             <Button
               ref={telegramIntentButtonRef}
               variant="outlineMuted"
               type="button"
               aria-expanded={telegramIntent}
               aria-controls="steward-telegram-login-widget"
-              onClick={() => {
-                setError(null);
-                setTelegramIntent(true);
-              }}
-              disabled={isLoading || telegramIntent}
+              onClick={handleTelegramIntent}
+              disabled={providerActionsDisabled || telegramIntent}
               className="hosted-signin-focus-emphasis"
             >
               {loading === "telegram" ? (
@@ -2770,7 +3253,7 @@ export default function StewardLoginSection() {
               aria-expanded={showWalletOptions || walletButtonsMounted}
               aria-controls="steward-wallet-options"
               onClick={() => setShowWalletOptions((v) => !v)}
-              disabled={isLoading || walletButtonsMounted}
+              disabled={providerActionsDisabled || walletButtonsMounted}
               className={
                 hasIdentityProviders
                   ? "hosted-signin-focus-emphasis col-span-2 sm:col-span-1"
@@ -2793,7 +3276,7 @@ export default function StewardLoginSection() {
         </fieldset>
       )}
 
-      {providers.telegram && telegramIntent && (
+      {telegramRenderable && telegramIntent && (
         <fieldset
           id="steward-telegram-login-widget"
           ref={telegramRegionRef}
@@ -2806,9 +3289,17 @@ export default function StewardLoginSection() {
           {telegramBotUsername ? (
             <TelegramLoginWidget
               botUsername={telegramBotUsername}
-              disabled={isLoading}
-              onAuth={handleTelegramAuth}
-              onError={handleTelegramError}
+              disabled={providerActionsDisabled}
+              onAuth={(payload) => {
+                if (telegramIntentGeneration !== null) {
+                  void handleTelegramAuth(payload, telegramIntentGeneration);
+                }
+              }}
+              onError={(message) => {
+                if (telegramIntentGeneration !== null) {
+                  handleTelegramError(message, telegramIntentGeneration);
+                }
+              }}
             />
           ) : (
             <Alert variant="destructive">
@@ -2822,16 +3313,24 @@ export default function StewardLoginSection() {
             variant="ghostMuted"
             type="button"
             onClick={() => {
+              if (sessionCommitGenerationRef.current !== null) return;
+              const { generation } = rotateProviderIntent();
               setTelegramIntent(false);
-              window.setTimeout(
-                () =>
+              setTelegramIntentGeneration(null);
+              setLoading(null);
+              window.setTimeout(() => {
+                if (isProviderIntentCurrent(generation)) {
                   telegramIntentButtonRef.current?.focus({
                     preventScroll: true,
-                  }),
-                0,
-              );
+                  });
+                }
+              }, 0);
             }}
-            disabled={isLoading}
+            disabled={
+              !providersLiveConfirmed ||
+              telegramIntentGeneration === null ||
+              sessionCommitGeneration !== null
+            }
             className="w-full"
           >
             {t("cloud.login.button.cancelTelegram", {
@@ -2850,44 +3349,103 @@ export default function StewardLoginSection() {
         >
           {(showWalletOptions || walletButtonsMounted) &&
             (walletButtonsMounted ? (
-              <Suspense
-                fallback={
-                  <div className="flex min-h-touch items-center justify-center py-2.5">
-                    <Spinner />
-                  </div>
-                }
-              >
-                <StewardWalletProviders
-                  enableEvm={providers.siwe === true}
-                  enableSolana={providers.siws === true}
+              <div className="space-y-2">
+                <Suspense
+                  fallback={
+                    <div
+                      className="flex min-h-touch items-center justify-center py-2.5"
+                      role="status"
+                      aria-label={t("cloud.login.wallet.loading", {
+                        defaultValue: "Loading wallet sign-in",
+                      })}
+                    >
+                      <Spinner />
+                    </div>
+                  }
                 >
-                  <WalletButtons
-                    auth={auth}
-                    autoStart={autoStartWallet}
-                    disabled={isLoading}
-                    siwe={providers.siwe === true}
-                    siws={providers.siws === true}
-                    loadingProvider={
-                      loading === "ethereum" || loading === "solana"
-                        ? (loading as WalletKind)
-                        : null
+                  <StewardWalletProviders
+                    enableEvm={
+                      mountedWalletKind === "ethereum" &&
+                      providers.siwe === true
                     }
-                    onAutoStartHandled={() => setAutoStartWallet(null)}
-                    onLoadingChange={(kind) => setLoading(kind)}
-                    onSuccess={(result) =>
-                      handleSuccess(result.token, result.refreshToken)
+                    enableSolana={
+                      mountedWalletKind === "solana" && providers.siws === true
                     }
-                    onError={(walletError) => {
-                      setError(
-                        walletError.message ||
-                          t("cloud.login.error.walletFailed", {
-                            defaultValue: "Wallet sign-in failed",
-                          }),
-                      );
-                    }}
-                  />
-                </StewardWalletProviders>
-              </Suspense>
+                  >
+                    <WalletButtons
+                      auth={auth}
+                      autoStart={autoStartWallet}
+                      disabled={providerActionsDisabled}
+                      siwe={
+                        mountedWalletKind === "ethereum" &&
+                        providers.siwe === true
+                      }
+                      siws={
+                        mountedWalletKind === "solana" &&
+                        providers.siws === true
+                      }
+                      loadingProvider={
+                        loading === "ethereum" || loading === "solana"
+                          ? (loading as WalletKind)
+                          : null
+                      }
+                      onAutoStartHandled={() => {
+                        if (
+                          walletIntentGeneration !== null &&
+                          isProviderIntentCurrent(walletIntentGeneration)
+                        ) {
+                          setAutoStartWallet(null);
+                        }
+                      }}
+                      onLoadingChange={(kind) => {
+                        if (
+                          walletIntentGeneration !== null &&
+                          isProviderIntentCurrent(walletIntentGeneration)
+                        ) {
+                          setLoading(kind);
+                        }
+                      }}
+                      onSuccess={(result) => {
+                        if (walletIntentGeneration === null) return;
+                        return handleSuccess(
+                          result.token,
+                          result.refreshToken,
+                          walletIntentGeneration,
+                        );
+                      }}
+                      onError={(walletError) => {
+                        if (
+                          walletIntentGeneration === null ||
+                          !isProviderIntentCurrent(walletIntentGeneration)
+                        ) {
+                          return;
+                        }
+                        setError(
+                          walletError.message ||
+                            t("cloud.login.error.walletFailed", {
+                              defaultValue: "Wallet sign-in failed",
+                            }),
+                        );
+                      }}
+                    />
+                  </StewardWalletProviders>
+                </Suspense>
+                <Button
+                  variant="ghostMuted"
+                  type="button"
+                  onClick={cancelWalletIntent}
+                  disabled={
+                    !providersLiveConfirmed ||
+                    walletIntentGeneration === null ||
+                    sessionCommitGeneration !== null
+                  }
+                  className="hosted-signin-focus-emphasis w-full"
+                >
+                  {t("cloud.login.wallet.chooseAnother", {
+                    defaultValue: "Use another wallet",
+                  })}
+                </Button>
+              </div>
             ) : (
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 {providers.siwe && (
@@ -2895,7 +3453,7 @@ export default function StewardLoginSection() {
                     variant="outlineMuted"
                     type="button"
                     onClick={() => handleWalletIntent("ethereum")}
-                    disabled={isLoading}
+                    disabled={providerActionsDisabled}
                     className="hosted-signin-focus-emphasis"
                   >
                     {t("cloud.login.wallet.evm", {
@@ -2908,7 +3466,7 @@ export default function StewardLoginSection() {
                     variant="outlineMuted"
                     type="button"
                     onClick={() => handleWalletIntent("solana")}
-                    disabled={isLoading}
+                    disabled={providerActionsDisabled}
                     className="hosted-signin-focus-emphasis"
                   >
                     {t("cloud.login.wallet.solana", {

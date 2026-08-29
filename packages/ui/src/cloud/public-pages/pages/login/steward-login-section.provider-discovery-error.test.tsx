@@ -22,6 +22,8 @@ const harness = vi.hoisted(() => ({
     | "fail-twice-then-succeed"
     | "always-fail"
     | "hang"
+    | "all-disabled"
+    | "oauth-only"
     | "malformed-then-succeed",
 }));
 
@@ -37,6 +39,26 @@ const LIVE_PROVIDERS = {
   twitter: true,
   telegram: true,
   oauth: ["google", "discord", "github", "twitter"],
+};
+
+const ALL_DISABLED_PROVIDERS = {
+  passkey: false,
+  email: false,
+  sms: false,
+  siwe: false,
+  siws: false,
+  google: false,
+  discord: false,
+  github: false,
+  twitter: false,
+  telegram: false,
+  oauth: [],
+};
+
+const OAUTH_ONLY_PROVIDERS = {
+  ...ALL_DISABLED_PROVIDERS,
+  google: true,
+  oauth: ["google"],
 };
 
 vi.mock("../../lib/steward-session", () => ({
@@ -60,6 +82,12 @@ vi.mock("@stwd/sdk", () => ({
       harness.getProvidersCalls += 1;
       if (harness.mode === "hang") {
         return new Promise(() => {});
+      }
+      if (harness.mode === "all-disabled") {
+        return Promise.resolve(ALL_DISABLED_PROVIDERS);
+      }
+      if (harness.mode === "oauth-only") {
+        return Promise.resolve(OAUTH_ONLY_PROVIDERS);
       }
       if (
         harness.mode === "malformed-then-succeed" &&
@@ -189,10 +217,19 @@ describe("StewardLoginSection provider discovery truth", () => {
 
     renderSection();
 
-    expect(await screen.findByRole("button", { name: "Google" })).toBeTruthy();
+    const google = (await screen.findByRole("button", {
+      name: "Google",
+    })) as HTMLButtonElement;
+    expect(google.disabled).toBe(true);
     await waitFor(() => expect(harness.getProvidersCalls).toBe(1));
     expect(screen.queryByText("Sign-in options couldn't load")).toBeNull();
-    expect(screen.getByRole("button", { name: "Discord" })).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Discord" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect((screen.getByLabelText("Email") as HTMLInputElement).disabled).toBe(
+      true,
+    );
     expect(
       screen.getByText(
         "Retry to load the sign-in methods enabled for this Eliza Cloud account.",
@@ -253,5 +290,29 @@ describe("StewardLoginSection provider discovery truth", () => {
     expect(screen.getByRole("button", { name: "X" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Telegram" })).toBeTruthy();
     expect(harness.getProvidersCalls).toBe(3);
+  });
+
+  it("renders an explicit retry state for an authoritative all-disabled response", async () => {
+    harness.mode = "all-disabled";
+    renderSection();
+
+    expect(
+      await screen.findByText("No sign-in methods are available"),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Email")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Magic Link" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Telegram" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Retry sign-in options" }),
+    ).toBeTruthy();
+  });
+
+  it("does not render an inert email field for an OAuth-only response", async () => {
+    harness.mode = "oauth-only";
+    renderSection();
+
+    expect(await screen.findByRole("button", { name: "Google" })).toBeTruthy();
+    expect(screen.queryByLabelText("Email")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Magic Link" })).toBeNull();
   });
 });

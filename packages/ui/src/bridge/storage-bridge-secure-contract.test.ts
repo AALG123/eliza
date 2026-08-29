@@ -34,6 +34,8 @@ const nativeStores = vi.hoisted(() => ({
   secureSetWait: null as Promise<void> | null,
   secureDeleteWait: null as Promise<void> | null,
   secureGetWait: null as Promise<void> | null,
+  secureSetHook: null as null | ((key: string, value: string) => Promise<void>),
+  secureGetHook: null as null | ((key: string) => void),
   operations: [] as string[],
 }));
 
@@ -78,6 +80,7 @@ vi.mock("@elizaos/capacitor-secure-store", () => ({
       nativeStores.operations.push(`get:start:${key}`);
       await nativeStores.secureGetWait;
       if (!nativeStores.secureAvailable) throw new Error("bridge cold");
+      nativeStores.secureGetHook?.(key);
       nativeStores.operations.push(`get:done:${key}`);
       return nativeStores.secure.has(key)
         ? { ok: true, value: nativeStores.secure.get(key) }
@@ -86,6 +89,7 @@ vi.mock("@elizaos/capacitor-secure-store", () => ({
     set: async ({ key, value }: { key: string; value: string }) => {
       nativeStores.operations.push(`set:start:${key}`);
       await nativeStores.secureSetWait;
+      await nativeStores.secureSetHook?.(key, value);
       if (!nativeStores.secureAvailable) throw new Error("bridge cold");
       if (nativeStores.secureSetError === "thrown")
         throw new Error("bridge failed");
@@ -135,6 +139,8 @@ describe("native protected-storage bridge contract", () => {
     nativeStores.secureSetWait = null;
     nativeStores.secureDeleteWait = null;
     nativeStores.secureGetWait = null;
+    nativeStores.secureSetHook = null;
+    nativeStores.secureGetHook = null;
     nativeStores.operations.length = 0;
     window.localStorage.clear();
     window.sessionStorage.clear();
@@ -476,6 +482,183 @@ describe("native protected-storage bridge contract", () => {
         "verified-steward-token",
       );
       expect(transitions).toEqual(["present"]);
+    } finally {
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it.each([null, "prior-steward-token"])(
+    "atomically rolls an aborted protected write back to %s",
+    async (previousToken) => {
+      const bridge = await import("./storage-bridge");
+      await bridge.removeStorageValue(STEWARD_TOKEN_KEY);
+      if (previousToken !== null) {
+        await bridge.setStorageValue(STEWARD_TOKEN_KEY, previousToken);
+      }
+      nativeStores.operations.length = 0;
+      let releaseWrite: () => void = () => {};
+      nativeStores.secureSetWait = new Promise<void>((resolve) => {
+        releaseWrite = resolve;
+      });
+      const transitions: string[] = [];
+      const listener = (event: Event) => {
+        transitions.push(
+          (event as CustomEvent<{ state: string }>).detail.state,
+        );
+      };
+      window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      const controller = new AbortController();
+
+      try {
+        const write = writeStoredStewardToken("aborted-steward-token", {
+          signal: controller.signal,
+        });
+        await vi.waitFor(() => {
+          expect(nativeStores.operations).toContain(
+            "set:start:session.steward_token",
+          );
+        });
+        controller.abort();
+        releaseWrite();
+
+        await expect(write).rejects.toMatchObject({ name: "AbortError" });
+        expect(nativeStores.secure.get("session.steward_token") ?? null).toBe(
+          previousToken,
+        );
+        expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+          previousToken,
+        );
+        expect(transitions).toEqual([]);
+      } finally {
+        window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      }
+    },
+  );
+
+  it("refreshes the protected cache while a newer write waits behind rollback", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "prior-steward-token");
+    nativeStores.operations.length = 0;
+
+    let releasePersistenceRead: () => void = () => {};
+    nativeStores.secureGetWait = new Promise<void>((resolve) => {
+      releasePersistenceRead = resolve;
+    });
+    let markRollbackStarted: () => void = () => {};
+    const rollbackStarted = new Promise<void>((resolve) => {
+      markRollbackStarted = resolve;
+    });
+    let releaseRollback: () => void = () => {};
+    const rollbackWait = new Promise<void>((resolve) => {
+      releaseRollback = resolve;
+    });
+    let markNewerStarted: () => void = () => {};
+    const newerStarted = new Promise<void>((resolve) => {
+      markNewerStarted = resolve;
+    });
+    let releaseNewer: () => void = () => {};
+    const newerWait = new Promise<void>((resolve) => {
+      releaseNewer = resolve;
+    });
+    nativeStores.secureSetHook = async (_key, value) => {
+      if (value === "prior-steward-token") {
+        markRollbackStarted();
+        await rollbackWait;
+      }
+      if (value === "newer-steward-token") {
+        markNewerStarted();
+        await newerWait;
+      }
+    };
+    const controller = new AbortController();
+    const write = writeStoredStewardToken("aborted-steward-token", {
+      signal: controller.signal,
+    });
+
+    try {
+      await vi.waitFor(() => {
+        expect(nativeStores.operations).toContain(
+          "get:start:session.steward_token",
+        );
+      });
+      controller.abort();
+      nativeStores.secureGetWait = null;
+      releasePersistenceRead();
+      await rollbackStarted;
+
+      const newerWrite = bridge.setStorageValue(
+        STEWARD_TOKEN_KEY,
+        "newer-steward-token",
+      );
+      releaseRollback();
+      await newerStarted;
+      await expect(write).rejects.toMatchObject({ name: "AbortError" });
+
+      expect(nativeStores.secure.get("session.steward_token")).toBe(
+        "prior-steward-token",
+      );
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "prior-steward-token",
+      );
+
+      releaseNewer();
+      await newerWrite;
+      expect(nativeStores.secure.get("session.steward_token")).toBe(
+        "newer-steward-token",
+      );
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "newer-steward-token",
+      );
+    } finally {
+      releasePersistenceRead();
+      releaseRollback();
+      releaseNewer();
+    }
+  });
+
+  it("preserves an external newer protected value when rollback loses its CAS", async () => {
+    const bridge = await import("./storage-bridge");
+    await bridge.setStorageValue(STEWARD_TOKEN_KEY, "prior-steward-token");
+    nativeStores.operations.length = 0;
+    let stewardGetCount = 0;
+    nativeStores.secureGetHook = (key) => {
+      if (key !== "session.steward_token") return;
+      stewardGetCount += 1;
+      if (stewardGetCount === 2) {
+        nativeStores.secure.set(key, "external-newer-token");
+      }
+    };
+    let releaseWrite: () => void = () => {};
+    nativeStores.secureSetWait = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const transitions: string[] = [];
+    const listener = (event: Event) => {
+      transitions.push((event as CustomEvent<{ state: string }>).detail.state);
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    const controller = new AbortController();
+
+    try {
+      const write = writeStoredStewardToken("aborted-steward-token", {
+        signal: controller.signal,
+      });
+      await vi.waitFor(() => {
+        expect(nativeStores.operations).toContain(
+          "set:start:session.steward_token",
+        );
+      });
+      controller.abort();
+      releaseWrite();
+
+      await expect(write).rejects.toMatchObject({ name: "AbortError" });
+      expect(nativeStores.secure.get("session.steward_token")).toBe(
+        "external-newer-token",
+      );
+      expect(window.localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "external-newer-token",
+      );
+      expect(transitions).toEqual([]);
     } finally {
       window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
     }

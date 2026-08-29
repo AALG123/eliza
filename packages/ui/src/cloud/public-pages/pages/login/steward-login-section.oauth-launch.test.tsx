@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const oauthState = vi.hoisted(() => ({
   nativePlatform: false,
+  providerDiscoveries: 0,
   openedExternalUrls: [] as string[],
   pkceError: null as Error | null,
   storeVerifier: true,
@@ -76,6 +77,7 @@ vi.mock("@stwd/sdk", () => ({
       return null;
     }
     getProviders() {
+      oauthState.providerDiscoveries += 1;
       return Promise.resolve({
         passkey: false,
         email: true,
@@ -244,6 +246,7 @@ describe("StewardLoginSection OAuth launch", () => {
   beforeEach(() => {
     stubHostedLoginLocation();
     oauthState.nativePlatform = false;
+    oauthState.providerDiscoveries = 0;
     oauthState.openedExternalUrls = [];
     oauthState.pkceError = null;
     oauthState.storeVerifier = true;
@@ -412,7 +415,11 @@ describe("StewardLoginSection OAuth launch", () => {
     });
     await waitFor(() =>
       expect(oauthState.syncedSessions).toEqual([
-        ["telegram-token", "telegram-refresh"],
+        [
+          "telegram-token",
+          "telegram-refresh",
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        ],
       ]),
     );
   });
@@ -444,9 +451,24 @@ describe("StewardLoginSection OAuth launch", () => {
 
       const historyRestore = new Event("pageshow");
       Object.defineProperty(historyRestore, "persisted", { value: true });
+      const discoveriesBeforeRestore = oauthState.providerDiscoveries;
       fireEvent(window, historyRestore);
 
-      await waitFor(() => expect(providerButton.disabled).toBe(false));
+      expect(providerButton.isConnected).toBe(false);
+      expect(
+        screen.getByRole("status", { name: "Loading sign-in options" }),
+      ).toBeTruthy();
+      await waitFor(() =>
+        expect(oauthState.providerDiscoveries).toBe(
+          discoveriesBeforeRestore + 1,
+        ),
+      );
+      const restoredProviderButton = await screen.findByRole("button", {
+        name: providerLabel,
+      });
+      expect((restoredProviderButton as HTMLButtonElement).disabled).toBe(
+        false,
+      );
     },
   );
 

@@ -207,7 +207,143 @@ describe("StewardLoginSection Telegram login", () => {
     expect(harness.syncSessionCookie).toHaveBeenCalledWith(
       "steward-token",
       "refresh-token",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(harness.writeToken).toHaveBeenCalledWith("steward-token");
+  });
+
+  it("keeps cancellation available during Telegram auth and ignores stale completion", async () => {
+    let finishTelegram:
+      | ((result: { token: string; refreshToken: string }) => void)
+      | undefined;
+    harness.signInWithTelegram.mockImplementation(
+      () =>
+        new Promise<{ token: string; refreshToken: string }>((resolve) => {
+          finishTelegram = resolve;
+        }),
+    );
+    render(
+      <MemoryRouter initialEntries={["/login"]}>
+        <StewardLoginSection />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Telegram",
+      }),
+    );
+    const script = await waitFor(() => {
+      const element = document.querySelector<HTMLScriptElement>(
+        'script[src="https://telegram.org/js/telegram-widget.js?22"]',
+      );
+      expect(element).not.toBeNull();
+      return element as HTMLScriptElement;
+    });
+    const callbackName = (script.getAttribute("data-onauth") ?? "").replace(
+      "(user)",
+      "",
+    );
+    const callback = (window as unknown as Record<string, unknown>)[
+      callbackName
+    ];
+    if (typeof callback !== "function") {
+      throw new Error("Telegram widget callback was not installed");
+    }
+    act(() => {
+      callback({
+        id: 123456,
+        auth_date: 1_789_999_999,
+        hash: "b".repeat(64),
+      });
+    });
+    await waitFor(() =>
+      expect(harness.signInWithTelegram).toHaveBeenCalledOnce(),
+    );
+
+    const cancel = screen.getByRole("button", {
+      name: "Use another sign-in method",
+    }) as HTMLButtonElement;
+    expect(cancel.disabled).toBe(false);
+    fireEvent.click(cancel);
+    expect(
+      screen.queryByRole("group", { name: "Telegram sign-in" }),
+    ).toBeNull();
+
+    await act(async () => {
+      finishTelegram?.({
+        token: "stale-steward-token",
+        refreshToken: "stale-refresh-token",
+      });
+      await Promise.resolve();
+    });
+    expect(harness.syncSessionCookie).not.toHaveBeenCalled();
+    expect(harness.writeToken).not.toHaveBeenCalled();
+  });
+
+  it("revokes a widget callback after the Telegram surface reports an error", async () => {
+    render(
+      <MemoryRouter initialEntries={["/login"]}>
+        <StewardLoginSection />
+      </MemoryRouter>,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Telegram",
+      }),
+    );
+    const script = await waitFor(() => {
+      const element = document.querySelector<HTMLScriptElement>(
+        'script[src="https://telegram.org/js/telegram-widget.js?22"]',
+      );
+      expect(element).not.toBeNull();
+      return element as HTMLScriptElement;
+    });
+    const callbackName = (script.getAttribute("data-onauth") ?? "").replace(
+      "(user)",
+      "",
+    );
+    const staleCallback = (window as unknown as Record<string, unknown>)[
+      callbackName
+    ];
+    if (typeof staleCallback !== "function") {
+      throw new Error("Telegram widget callback was not installed");
+    }
+
+    fireEvent.error(script);
+    expect(
+      await screen.findByText(
+        "Could not load Telegram sign-in. Check your connection and try again.",
+      ),
+    ).toBeTruthy();
+
+    act(() => {
+      staleCallback({
+        id: 123456,
+        auth_date: 1_789_999_999,
+        hash: "b".repeat(64),
+      });
+    });
+    await waitFor(() =>
+      expect(harness.signInWithTelegram).not.toHaveBeenCalled(),
+    );
+  });
+
+  it("does not offer Telegram when the local bot username is unavailable", async () => {
+    vi.stubEnv("VITE_TELEGRAM_BOT_USERNAME", "invalid username");
+
+    render(
+      <MemoryRouter initialEntries={["/login"]}>
+        <StewardLoginSection />
+      </MemoryRouter>,
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Magic Link" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Telegram" })).toBeNull();
+    expect(
+      document.querySelector('script[src^="https://telegram.org/js/"]'),
+    ).toBeNull();
   });
 });

@@ -153,10 +153,12 @@ describe("Steward Telegram account claim handoff", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
+    const controller = new AbortController();
     await exchangeStewardCodeViaApi("one-time-code", {
       redirectUri: "https://cloud.eliza.app/login",
       tenantId: "elizacloud",
       codeVerifier: "verifier",
+      signal: controller.signal,
     });
 
     expect(JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))).toEqual({
@@ -165,6 +167,7 @@ describe("Steward Telegram account claim handoff", () => {
       tenantId: "elizacloud",
       codeVerifier: "verifier",
     });
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(controller.signal);
     expect(peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE)).toBe(
       TOKEN,
     );

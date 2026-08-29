@@ -6,6 +6,7 @@
 // @vitest-environment jsdom
 
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -654,6 +655,41 @@ describe("StewardLoginSection passkey capability gating", () => {
       "person@example.com",
       { emailGrant: "grant-1" },
     );
+  });
+
+  it("revokes passkey enrollment when leaving during OTP verification", async () => {
+    capabilityRef.usable = true;
+    capabilityRef.reason = "available";
+    let finishVerification:
+      | ((result: { emailGrant: string }) => void)
+      | undefined;
+    stewardAuthSpies.verifyEmailOtp.mockImplementation(
+      () =>
+        new Promise<{ emailGrant: string }>((resolve) => {
+          finishVerification = resolve;
+        }),
+    );
+
+    renderSection();
+    const input = await screen.findByPlaceholderText("you@example.com");
+    fireEvent.change(input, { target: { value: "person@example.com" } });
+    fireEvent.click(screen.getByRole("button", { name: /^Passkey$/i }));
+
+    const codeInput = await screen.findByPlaceholderText("123456");
+    fireEvent.change(codeInput, { target: { value: "123456" } });
+    fireEvent.click(screen.getByRole("button", { name: /Create passkey/i }));
+    await waitFor(() =>
+      expect(stewardAuthSpies.verifyEmailOtp).toHaveBeenCalledOnce(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Back/i }));
+    expect(await screen.findByPlaceholderText("you@example.com")).toBeTruthy();
+
+    await act(async () => {
+      finishVerification?.({ emailGrant: "stale-grant" });
+      await Promise.resolve();
+    });
+    expect(stewardAuthSpies.addPasskey).not.toHaveBeenCalled();
   });
 
   it.each([

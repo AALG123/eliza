@@ -1,7 +1,7 @@
 /**
  * Exact-head browser regression for PR #29600's hosted-login wallet authority.
- * A session-cached SIWE flag may accelerate non-wallet first paint, but it must
- * not mount or expose a wallet until live provider discovery succeeds.
+ * A session-cached provider set may accelerate first paint, but no cached
+ * provider action may run until live provider discovery succeeds.
  */
 import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -42,8 +42,8 @@ const VIEWPORTS = [
   { name: "mobile", width: 390, height: 844 },
 ] as const;
 
-// "SIWE-only" describes the wallet capability: cached email remains usable so
-// a failed reconcile renders the non-destructive warning inside the real form.
+// "SIWE-only" describes the wallet capability. Cached email preserves the form
+// geometry through reconcile, but stays disabled until live authority returns.
 const SIWE_ONLY_PROVIDERS = {
   passkey: false,
   email: true,
@@ -393,9 +393,13 @@ for (const viewport of VIEWPORTS) {
     await assertExactHead(page);
     await expect.poll(authority.providerRequestCount).toBe(1);
 
-    // The cache may render its safe email method immediately. Cached wallet
-    // positives remain inert while the live request has no answer.
-    await expect(page.getByRole("textbox", { name: "Email" })).toBeVisible();
+    // The cache may preserve the email layout immediately, but sending email
+    // and every wallet positive remain inert without a live answer.
+    const email = page.getByRole("textbox", { name: "Email" });
+    const magicLink = page.getByRole("button", { name: "Magic Link" });
+    await expect(email).toBeVisible();
+    await expect(email).toBeDisabled();
+    await expect(magicLink).toBeDisabled();
     await expect(
       page.getByRole("button", { name: /Continue with a wallet/i }),
     ).toHaveCount(0);
@@ -414,6 +418,8 @@ for (const viewport of VIEWPORTS) {
     });
     await expect(retry).toBeVisible();
     await expect(retry).toBeEnabled();
+    await expect(email).toBeDisabled();
+    await expect(magicLink).toBeDisabled();
     await retry.focus();
     await expect(retry).toBeFocused();
     await expect(
@@ -440,6 +446,8 @@ for (const viewport of VIEWPORTS) {
       name: /Continue with a wallet/i,
     });
     await expect(walletToggle).toBeVisible();
+    await expect(email).toBeEnabled();
+    await expect(magicLink).toBeEnabled();
     await expect(warning).toHaveCount(0);
     expect(observed.providerStatuses).toEqual([503, 200]);
 
@@ -485,6 +493,21 @@ for (const viewport of VIEWPORTS) {
     assertCleanBoundaries(observed);
     await expect(page.getByRole("alert")).toHaveCount(0);
     await capture(page, testInfo, `${viewport.name}-4-lazy-siwe-boundary`);
+
+    // Recovery remains available while the inert account request is pending.
+    // Cancelling must synchronously unmount that provider intent, restore focus
+    // to the served chain choice, and cause no signature/authentication egress.
+    const chooseAnother = walletRegion.getByRole("button", {
+      name: /Use another wallet/i,
+    });
+    await expect(chooseAnother).toBeEnabled();
+    await chooseAnother.click();
+    await expect(ethereumButton).toBeVisible();
+    await expect(ethereumButton).toBeFocused();
+    await expect(solanaButton).toHaveCount(0);
+    expect(await readWalletMethods(page)).toEqual(walletMethods);
+    assertCleanBoundaries(observed);
+    await expect(page.getByRole("alert")).toHaveCount(0);
 
     await finishEvidence(page, testInfo, viewport, observed, walletMethods);
   });

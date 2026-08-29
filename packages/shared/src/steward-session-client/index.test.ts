@@ -273,9 +273,9 @@ describe("Steward session storage transitions", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "steward-token");
     localStorage.setItem(STEWARD_REFRESH_TOKEN_KEY, "legacy-refresh-token");
     const storageFailure = new Error("legacy refresh storage unavailable");
-    const originalRemoveItem = Storage.prototype.removeItem;
+    const originalRemoveItem = window.localStorage.removeItem;
     const removeItem = vi
-      .spyOn(Storage.prototype, "removeItem")
+      .spyOn(window.localStorage, "removeItem")
       .mockImplementation(function (this: Storage, key: string) {
         if (key === STEWARD_REFRESH_TOKEN_KEY) throw storageFailure;
         return Reflect.apply(originalRemoveItem, this, [key]);
@@ -312,7 +312,7 @@ describe("Steward session storage transitions", () => {
     };
     window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
     const setItem = vi
-      .spyOn(Storage.prototype, "setItem")
+      .spyOn(window.localStorage, "setItem")
       .mockImplementation(() => {
         throw storageFailure;
       });
@@ -330,7 +330,7 @@ describe("Steward session storage transitions", () => {
     }
 
     const removeItem = vi
-      .spyOn(Storage.prototype, "removeItem")
+      .spyOn(window.localStorage, "removeItem")
       .mockImplementation(() => {
         throw storageFailure;
       });
@@ -375,6 +375,146 @@ describe("Steward session storage transitions", () => {
     }
   });
 
+  it.each([null, "prior-token"])(
+    "rolls an aborted deferred persistence back to %s without publishing",
+    async (previousToken) => {
+      if (previousToken !== null) {
+        localStorage.setItem(STEWARD_TOKEN_KEY, previousToken);
+      }
+      let markPersistenceStarted: () => void = () => {};
+      const persistenceStarted = new Promise<void>((resolve) => {
+        markPersistenceStarted = resolve;
+      });
+      let releasePersistence: () => void = () => {};
+      const persistenceWait = new Promise<void>((resolve) => {
+        releasePersistence = resolve;
+      });
+      const unregisterPersistence = registerStewardTokenPersistence(
+        async (token) => {
+          markPersistenceStarted();
+          await persistenceWait;
+          localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        },
+      );
+      const transitions: StewardSessionChangeDetail[] = [];
+      const listener = (event: Event) => {
+        transitions.push(
+          (event as CustomEvent<StewardSessionChangeDetail>).detail,
+        );
+      };
+      window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      const controller = new AbortController();
+
+      try {
+        const write = writeStoredStewardToken("aborted-token", {
+          signal: controller.signal,
+        });
+        await persistenceStarted;
+        controller.abort();
+        releasePersistence();
+
+        await expect(write).rejects.toMatchObject({ name: "AbortError" });
+        expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(previousToken);
+        expect(transitions).toEqual([]);
+      } finally {
+        unregisterPersistence();
+        window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+      }
+    },
+  );
+
+  it("lets a newer queued write survive an aborted predecessor rollback", async () => {
+    let markFirstStarted: () => void = () => {};
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    let releaseFirst: () => void = () => {};
+    const firstWait = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        if (token === "aborted-token") {
+          markFirstStarted();
+          await firstWait;
+        }
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+      },
+    );
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    const controller = new AbortController();
+
+    try {
+      const first = writeStoredStewardToken("aborted-token", {
+        signal: controller.signal,
+      });
+      await firstStarted;
+      controller.abort();
+      const second = writeStoredStewardToken("newer-token");
+      releaseFirst();
+
+      await expect(first).rejects.toMatchObject({ name: "AbortError" });
+      await second;
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("newer-token");
+      expect(transitions.map(({ state }) => state)).toEqual(["present"]);
+    } finally {
+      unregisterPersistence();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
+  it("preserves a newer browser value when aborted-write rollback loses its CAS", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "prior-token");
+    let markAttemptPersisted: () => void = () => {};
+    const attemptPersisted = new Promise<void>((resolve) => {
+      markAttemptPersisted = resolve;
+    });
+    let releasePersistence: () => void = () => {};
+    const persistenceWait = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    const unregisterPersistence = registerStewardTokenPersistence(
+      async (token) => {
+        localStorage.setItem(STEWARD_TOKEN_KEY, token);
+        markAttemptPersisted();
+        await persistenceWait;
+      },
+    );
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    const controller = new AbortController();
+
+    try {
+      const write = writeStoredStewardToken("aborted-token", {
+        signal: controller.signal,
+      });
+      await attemptPersisted;
+      localStorage.setItem(STEWARD_TOKEN_KEY, "external-newer-token");
+      controller.abort();
+      releasePersistence();
+
+      await expect(write).rejects.toMatchObject({ name: "AbortError" });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(
+        "external-newer-token",
+      );
+      expect(transitions).toEqual([]);
+    } finally {
+      unregisterPersistence();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+  });
+
   it("does not publish cleared until the host confirms durable removal", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "steward-token");
     let releaseRemoval: () => void = () => {};
@@ -406,7 +546,7 @@ describe("Steward session storage transitions", () => {
   it("does not disguise a failed canonical read as a missing session", () => {
     const storageFailure = new Error("canonical storage unavailable");
     const getItem = vi
-      .spyOn(Storage.prototype, "getItem")
+      .spyOn(window.localStorage, "getItem")
       .mockImplementation(() => {
         throw storageFailure;
       });

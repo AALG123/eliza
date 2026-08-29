@@ -1,7 +1,13 @@
 /** Verifies StewardLoginSection wallet-method collapse (#19217). */
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -43,6 +49,11 @@ const mountedWalletCapabilities = vi.hoisted(() => ({
 const mountedProviderCapabilities = vi.hoisted(() => ({
   enableEvm: null as boolean | null,
   enableSolana: null as boolean | null,
+}));
+
+const walletBoundaryControl = vi.hoisted(() => ({
+  suspend: false,
+  pending: new Promise<void>(() => undefined),
 }));
 
 const PROVIDERS_CACHE_KEY = "eliza.steward.providers.v1:elizacloud";
@@ -133,6 +144,7 @@ vi.mock("../../../billing/wallet/steward-wallet-providers", () => ({
     enableEvm: boolean;
     enableSolana: boolean;
   }) => {
+    if (walletBoundaryControl.suspend) throw walletBoundaryControl.pending;
     mountedProviderCapabilities.enableEvm = enableEvm;
     mountedProviderCapabilities.enableSolana = enableSolana;
     return <>{children}</>;
@@ -140,10 +152,28 @@ vi.mock("../../../billing/wallet/steward-wallet-providers", () => ({
 }));
 
 vi.mock("./wallet-buttons", () => ({
-  WalletButtons: ({ siwe, siws }: { siwe: boolean; siws: boolean }) => {
+  WalletButtons: ({
+    siwe,
+    siws,
+    onLoadingChange,
+  }: {
+    siwe: boolean;
+    siws: boolean;
+    onLoadingChange: (kind: "ethereum" | "solana" | null) => void;
+  }) => {
     mountedWalletCapabilities.siwe = siwe;
     mountedWalletCapabilities.siws = siws;
-    return <div data-testid="mounted-wallet-buttons">Mounted wallet stack</div>;
+    return (
+      <>
+        <div data-testid="mounted-wallet-buttons">Mounted wallet stack</div>
+        <button
+          type="button"
+          onClick={() => onLoadingChange(siwe ? "ethereum" : "solana")}
+        >
+          Simulate wallet loading
+        </button>
+      </>
+    );
   },
 }));
 
@@ -203,6 +233,7 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
     mountedWalletCapabilities.siws = null;
     mountedProviderCapabilities.enableEvm = null;
     mountedProviderCapabilities.enableSolana = null;
+    walletBoundaryControl.suspend = false;
     window.sessionStorage.removeItem(PROVIDERS_CACHE_KEY);
   });
 
@@ -288,10 +319,10 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
     expect(lockedToggle.hasAttribute("disabled")).toBe(true);
     expect(screen.queryByRole("button", { name: /EVM wallet/i })).toBeNull();
     expect(await screen.findByTestId("mounted-wallet-buttons")).toBeTruthy();
-    expect(mountedWalletCapabilities).toEqual({ siwe: true, siws: true });
+    expect(mountedWalletCapabilities).toEqual({ siwe: true, siws: false });
     expect(mountedProviderCapabilities).toEqual({
       enableEvm: true,
-      enableSolana: true,
+      enableSolana: false,
     });
 
     const liveRegion = document.getElementById("steward-wallet-options");
@@ -300,6 +331,88 @@ describe("StewardLoginSection wallet collapse (#19217)", () => {
     // Focus must land in the controlled region (not body / not the disabled
     // toggle) after the peer button unmounts and the disclosure locks.
     expect(document.activeElement).toBe(liveRegion);
+  });
+
+  it("mounts only the selected Solana boundary when both chains are advertised", async () => {
+    await renderSection();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Continue with a wallet/i,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Solana wallet/i }),
+    );
+
+    expect(await screen.findByTestId("mounted-wallet-buttons")).toBeTruthy();
+    expect(mountedWalletCapabilities).toEqual({ siwe: false, siws: true });
+    expect(mountedProviderCapabilities).toEqual({
+      enableEvm: false,
+      enableSolana: true,
+    });
+  });
+
+  it("unmounts a cancelled chain before returning to the wallet choice", async () => {
+    await renderSection();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Continue with a wallet/i,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /EVM wallet/i }));
+
+    expect(await screen.findByTestId("mounted-wallet-buttons")).toBeTruthy();
+    expect(mountedProviderCapabilities).toEqual({
+      enableEvm: true,
+      enableSolana: false,
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Simulate wallet loading/i }),
+    );
+    const chooseAnother = screen.getByRole("button", {
+      name: /Use another wallet/i,
+    }) as HTMLButtonElement;
+    expect(chooseAnother.disabled).toBe(false);
+    fireEvent.click(chooseAnother);
+
+    expect(screen.queryByTestId("mounted-wallet-buttons")).toBeNull();
+    const evmChoice = screen.getByRole("button", { name: /EVM wallet/i });
+    expect(evmChoice).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Solana wallet/i })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(evmChoice));
+    // Returning to chain choice never mounted the peer Solana boundary.
+    expect(mountedProviderCapabilities).toEqual({
+      enableEvm: true,
+      enableSolana: false,
+    });
+  });
+
+  it("keeps wallet recovery available while the selected provider boundary is stalled", async () => {
+    walletBoundaryControl.suspend = true;
+    await renderSection();
+
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: /Continue with a wallet/i,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /EVM wallet/i }));
+
+    expect(
+      await screen.findByRole("status", { name: "Loading wallet sign-in" }),
+    ).toBeTruthy();
+    const chooseAnother = screen.getByRole("button", {
+      name: /Use another wallet/i,
+    }) as HTMLButtonElement;
+    expect(chooseAnother.disabled).toBe(false);
+    fireEvent.click(chooseAnother);
+
+    const evmChoice = screen.getByRole("button", { name: /EVM wallet/i });
+    expect(screen.getByRole("button", { name: /Solana wallet/i })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(evmChoice));
   });
 
   it.each([

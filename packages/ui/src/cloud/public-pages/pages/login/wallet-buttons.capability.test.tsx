@@ -2,41 +2,71 @@
 // @vitest-environment jsdom
 
 import type { StewardAuth } from "@stwd/sdk";
-import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { StrictMode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const walletHooks = vi.hoisted(() => ({
   connectAsync: vi.fn(),
+  connectors: [] as Array<{
+    getProvider: () => Promise<unknown>;
+    id: string;
+    name: string;
+    type: string;
+  }>,
+  connectModalAvailable: true,
+  connectModalOpen: false,
+  evmAccount: {
+    address: undefined as `0x${string}` | undefined,
+    isConnected: false,
+    isConnecting: false,
+  },
   openConnectModal: vi.fn(),
+  solanaModalVisible: false,
+  solanaWallet: {
+    connected: false,
+    connecting: false,
+    publicKey: null as { toBase58: () => string } | null,
+    signMessage: undefined as
+      | ((message: Uint8Array) => Promise<Uint8Array>)
+      | undefined,
+  },
   setSolanaModalVisible: vi.fn(),
   signMessageAsync: vi.fn(),
 }));
 
 vi.mock("@rainbow-me/rainbowkit", () => ({
   useConnectModal: () => ({
-    openConnectModal: walletHooks.openConnectModal,
+    connectModalOpen: walletHooks.connectModalOpen,
+    openConnectModal: walletHooks.connectModalAvailable
+      ? walletHooks.openConnectModal
+      : undefined,
   }),
 }));
 
 vi.mock("@solana/wallet-adapter-react", () => ({
-  useWallet: () => ({
-    connected: false,
-    publicKey: null,
-    signMessage: undefined,
-  }),
+  useWallet: () => walletHooks.solanaWallet,
 }));
 
 vi.mock("@solana/wallet-adapter-react-ui", () => ({
   useWalletModal: () => ({
     setVisible: walletHooks.setSolanaModalVisible,
+    visible: walletHooks.solanaModalVisible,
   }),
 }));
 
 vi.mock("wagmi", () => ({
-  useAccount: () => ({ address: undefined, isConnected: false }),
+  useAccount: () => walletHooks.evmAccount,
   useConnect: () => ({
     connectAsync: walletHooks.connectAsync,
-    connectors: [],
+    connectors: walletHooks.connectors,
   }),
   useSignMessage: () => ({
     signMessageAsync: walletHooks.signMessageAsync,
@@ -52,7 +82,72 @@ import { WalletButtons } from "./wallet-buttons";
 
 const auth = {} as StewardAuth;
 
+function resetWalletHooks() {
+  walletHooks.connectors.length = 0;
+  walletHooks.connectModalAvailable = true;
+  walletHooks.connectModalOpen = false;
+  walletHooks.evmAccount.address = undefined;
+  walletHooks.evmAccount.isConnected = false;
+  walletHooks.evmAccount.isConnecting = false;
+  walletHooks.solanaModalVisible = false;
+  walletHooks.solanaWallet.connected = false;
+  walletHooks.solanaWallet.connecting = false;
+  walletHooks.solanaWallet.publicKey = null;
+  walletHooks.solanaWallet.signMessage = undefined;
+  Reflect.deleteProperty(window, "ethereum");
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
+
+function renderWalletButtons({
+  authOverride = auth,
+  autoStart = null,
+  siwe = false,
+  siws = false,
+  strictMode = false,
+}: {
+  authOverride?: StewardAuth;
+  autoStart?: "ethereum" | "solana" | null;
+  siwe?: boolean;
+  siws?: boolean;
+  strictMode?: boolean;
+} = {}) {
+  const props = {
+    auth: authOverride,
+    autoStart,
+    disabled: false,
+    siwe,
+    siws,
+    loadingProvider: null,
+    onLoadingChange: vi.fn(),
+    onAutoStartHandled: vi.fn(),
+    onSuccess: vi.fn(),
+    onError: vi.fn(),
+  } as const;
+  const renderElement = () => {
+    const buttons = <WalletButtons {...props} />;
+    return strictMode ? <StrictMode>{buttons}</StrictMode> : buttons;
+  };
+  const view = render(renderElement());
+
+  return {
+    ...view,
+    props,
+    rerenderWalletButtons: () => view.rerender(renderElement()),
+  };
+}
+
 describe("WalletButtons capability gating", () => {
+  beforeEach(resetWalletHooks);
+
   afterEach(() => {
     cleanup();
     vi.clearAllMocks();
@@ -104,4 +199,514 @@ describe("WalletButtons capability gating", () => {
       ).toBe(siws);
     },
   );
+});
+
+describe("WalletButtons modal intent lifecycle", () => {
+  beforeEach(resetWalletHooks);
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+  });
+
+  it("does not sign when an unrelated EVM connection arrives after modal cancellation", async () => {
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() =>
+      expect(walletHooks.openConnectModal).toHaveBeenCalledTimes(1),
+    );
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"]]);
+
+    walletHooks.connectModalOpen = true;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith("ethereum");
+    walletHooks.connectModalOpen = false;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"], [null]]);
+
+    walletHooks.evmAccount.address =
+      "0x1111111111111111111111111111111111111111";
+    walletHooks.evmAccount.isConnected = true;
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSIWE).not.toHaveBeenCalled());
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"], [null]]);
+  });
+
+  it("fails EVM intent closed when connecting starts after modal close", async () => {
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() =>
+      expect(walletHooks.openConnectModal).toHaveBeenCalledTimes(1),
+    );
+    walletHooks.connectModalOpen = true;
+    rerenderWalletButtons();
+    walletHooks.connectModalOpen = false;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"], [null]]);
+
+    walletHooks.evmAccount.isConnecting = true;
+    rerenderWalletButtons();
+    walletHooks.evmAccount.isConnecting = false;
+    walletHooks.evmAccount.isConnected = true;
+    walletHooks.evmAccount.address =
+      "0x5555555555555555555555555555555555555555";
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSIWE).not.toHaveBeenCalled());
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it("reports unavailable EVM connection without arming a signing intent", async () => {
+    walletHooks.connectModalAvailable = false;
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"], [null]]);
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message:
+        "Ethereum wallet connection is unavailable. Refresh and try again.",
+    });
+    walletHooks.evmAccount.address =
+      "0x3333333333333333333333333333333333333333";
+    walletHooks.evmAccount.isConnected = true;
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSIWE).not.toHaveBeenCalled());
+  });
+
+  it("clears EVM intent when opening the connect modal throws", async () => {
+    walletHooks.openConnectModal.mockImplementationOnce(() => {
+      throw new Error("EVM modal launch failed");
+    });
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"], [null]]);
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: "EVM modal launch failed",
+    });
+    walletHooks.evmAccount.address =
+      "0x4444444444444444444444444444444444444444";
+    walletHooks.evmAccount.isConnected = true;
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSIWE).not.toHaveBeenCalled());
+    expect(props.onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps EVM intent through an in-progress connection and signs once", async () => {
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() =>
+      expect(walletHooks.openConnectModal).toHaveBeenCalledTimes(1),
+    );
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"]]);
+
+    walletHooks.connectModalOpen = true;
+    rerenderWalletButtons();
+    walletHooks.connectModalOpen = false;
+    walletHooks.evmAccount.isConnecting = true;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith("ethereum");
+    walletHooks.evmAccount.isConnecting = false;
+    walletHooks.evmAccount.isConnected = true;
+    walletHooks.evmAccount.address =
+      "0x2222222222222222222222222222222222222222";
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSIWE).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(props.onLoadingChange).toHaveBeenLastCalledWith(null),
+    );
+  });
+
+  it("does not sign when an unrelated Solana connection arrives after modal cancellation", () => {
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    expect(walletHooks.setSolanaModalVisible).toHaveBeenCalledWith(true);
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"]]);
+
+    walletHooks.solanaModalVisible = true;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith("solana");
+    walletHooks.solanaModalVisible = false;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"], [null]]);
+
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "unrelated-solana-account",
+    };
+    rerenderWalletButtons();
+
+    expect(signInWithSolana).not.toHaveBeenCalled();
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"], [null]]);
+  });
+
+  it("fails Solana intent closed when connecting starts after modal close", async () => {
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    expect(walletHooks.setSolanaModalVisible).toHaveBeenCalledWith(true);
+    walletHooks.solanaModalVisible = true;
+    rerenderWalletButtons();
+    walletHooks.solanaModalVisible = false;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"], [null]]);
+
+    walletHooks.solanaWallet.connecting = true;
+    rerenderWalletButtons();
+    walletHooks.solanaWallet.connecting = false;
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "solana-account-after-late-connecting",
+    };
+    walletHooks.solanaWallet.signMessage = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([7, 8, 9]));
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSolana).not.toHaveBeenCalled());
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it("clears Solana intent when opening the wallet modal throws", async () => {
+    walletHooks.setSolanaModalVisible.mockImplementationOnce(() => {
+      throw new Error("Solana modal launch failed");
+    });
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+
+    expect(props.onError).toHaveBeenCalledTimes(1);
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"], [null]]);
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: "Solana modal launch failed",
+    });
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "unrelated-solana-account-after-launch-failure",
+    };
+    walletHooks.solanaWallet.signMessage = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([4, 5, 6]));
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSolana).not.toHaveBeenCalled());
+    expect(props.onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases the modal loading lock for an unsupported connected Solana wallet", async () => {
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    walletHooks.solanaModalVisible = true;
+    rerenderWalletButtons();
+    walletHooks.solanaModalVisible = false;
+    walletHooks.solanaWallet.connecting = true;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith("solana");
+
+    walletHooks.solanaWallet.connecting = false;
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "solana-wallet-without-message-signing",
+    };
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(props.onError).toHaveBeenCalledTimes(1));
+    expect(props.onError.mock.calls[0]?.[0]).toMatchObject({
+      message: "Connected Solana wallet does not support message signing.",
+    });
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith(null);
+    expect(signInWithSolana).not.toHaveBeenCalled();
+  });
+
+  it("keeps Solana intent through an in-progress connection and signs once", async () => {
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    expect(walletHooks.setSolanaModalVisible).toHaveBeenCalledWith(true);
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"]]);
+
+    walletHooks.solanaModalVisible = true;
+    rerenderWalletButtons();
+    walletHooks.solanaModalVisible = false;
+    walletHooks.solanaWallet.connecting = true;
+    rerenderWalletButtons();
+    expect(props.onLoadingChange).toHaveBeenLastCalledWith("solana");
+    walletHooks.solanaWallet.connecting = false;
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "connected-solana-account",
+    };
+    walletHooks.solanaWallet.signMessage = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([1, 2, 3]));
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSolana).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(props.onLoadingChange).toHaveBeenLastCalledWith(null),
+    );
+  });
+});
+
+describe("WalletButtons deferred intent liveness", () => {
+  beforeEach(resetWalletHooks);
+
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    Reflect.deleteProperty(window, "ethereum");
+  });
+
+  it("routes a production-shaped unavailable injected connector to RainbowKit", async () => {
+    walletHooks.connectors.push(
+      {
+        getProvider: async () => undefined,
+        id: "injected",
+        name: "Injected",
+        type: "injected",
+      },
+      {
+        getProvider: async () => ({}),
+        id: "walletConnect",
+        name: "WalletConnect",
+        type: "walletConnect",
+      },
+    );
+    const { props } = renderWalletButtons({ siwe: true });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+
+    await waitFor(() =>
+      expect(walletHooks.openConnectModal).toHaveBeenCalledTimes(1),
+    );
+    expect(walletHooks.connectAsync).not.toHaveBeenCalled();
+    expect(props.onLoadingChange.mock.calls).toEqual([["ethereum"]]);
+  });
+
+  it("does not continue to account request or SIWE after unmounting a deferred EIP-1193 lookup", async () => {
+    const accounts = createDeferred<readonly string[] | null>();
+    const request = vi.fn(({ method }: { method: string }) => {
+      if (method === "eth_accounts") return accounts.promise;
+      return Promise.resolve(["0x6666666666666666666666666666666666666666"]);
+    });
+    Object.defineProperty(window, "ethereum", {
+      configurable: true,
+      value: { request },
+    });
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, unmount } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+    unmount();
+    await act(async () => {
+      accounts.resolve(["0x6666666666666666666666666666666666666666"]);
+      await accounts.promise;
+    });
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(signInWithSIWE).not.toHaveBeenCalled();
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+    expect(props.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("does not start SIWE when a deferred wagmi connect resolves after unmount", async () => {
+    walletHooks.connectors.push({
+      getProvider: async () => ({}),
+      id: "injected",
+      name: "Injected",
+      type: "injected",
+    });
+    const connected = createDeferred<{
+      accounts: [`0x${string}`, ...`0x${string}`[]];
+    }>();
+    walletHooks.connectAsync.mockImplementationOnce(() => connected.promise);
+    const signInWithSIWE = vi.fn().mockResolvedValue({});
+    const { props, unmount } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() =>
+      expect(walletHooks.connectAsync).toHaveBeenCalledTimes(1),
+    );
+    unmount();
+    await act(async () => {
+      connected.resolve({
+        accounts: ["0x7777777777777777777777777777777777777777"],
+      });
+      await connected.promise;
+    });
+
+    expect(signInWithSIWE).not.toHaveBeenCalled();
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+    expect(props.onSuccess).not.toHaveBeenCalled();
+  });
+
+  it("blocks a deferred SIWE signer callback and completion after unmount", async () => {
+    walletHooks.evmAccount.address =
+      "0x8888888888888888888888888888888888888888";
+    walletHooks.evmAccount.isConnected = true;
+    const sdkResult = createDeferred<Record<string, never>>();
+    let sdkSigner: ((message: string) => Promise<string>) | undefined;
+    const signInWithSIWE = vi.fn(
+      (_address: string, signer: (message: string) => Promise<string>) => {
+        sdkSigner = signer;
+        return sdkResult.promise;
+      },
+    );
+    const { props, unmount } = renderWalletButtons({
+      authOverride: { signInWithSIWE } as unknown as StewardAuth,
+      siwe: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /EVM wallet/i }));
+    await waitFor(() => expect(sdkSigner).toBeTypeOf("function"));
+    unmount();
+
+    await expect(sdkSigner?.("late SIWE message")).rejects.toThrow(
+      "Wallet sign-in intent expired.",
+    );
+    expect(walletHooks.signMessageAsync).not.toHaveBeenCalled();
+    await act(async () => {
+      sdkResult.resolve({});
+      await sdkResult.promise;
+    });
+    expect(props.onSuccess).not.toHaveBeenCalled();
+    expect(props.onError).not.toHaveBeenCalled();
+  });
+
+  it("blocks a deferred SIWS signer callback and completion after unmount", async () => {
+    const walletSigner = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([10, 11, 12]));
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "deferred-solana-account",
+    };
+    walletHooks.solanaWallet.signMessage = walletSigner;
+    const sdkResult = createDeferred<Record<string, never>>();
+    let sdkSigner: ((message: Uint8Array) => Promise<Uint8Array>) | undefined;
+    const signInWithSolana = vi.fn(
+      (
+        _publicKey: string,
+        signer: (message: Uint8Array) => Promise<Uint8Array>,
+      ) => {
+        sdkSigner = signer;
+        return sdkResult.promise;
+      },
+    );
+    const { props, unmount } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      siws: true,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Solana wallet/i }));
+    await waitFor(() => expect(sdkSigner).toBeTypeOf("function"));
+    unmount();
+
+    await expect(sdkSigner?.(new Uint8Array([1]))).rejects.toThrow(
+      "Wallet sign-in intent expired.",
+    );
+    expect(walletSigner).not.toHaveBeenCalled();
+    await act(async () => {
+      sdkResult.resolve({});
+      await sdkResult.promise;
+    });
+    expect(props.onSuccess).not.toHaveBeenCalled();
+    expect(props.onError).not.toHaveBeenCalled();
+  });
+
+  it("preserves one Solana auto-start intent through StrictMode effect replay", async () => {
+    const signInWithSolana = vi.fn().mockResolvedValue({});
+    const { props, rerenderWalletButtons } = renderWalletButtons({
+      authOverride: { signInWithSolana } as unknown as StewardAuth,
+      autoStart: "solana",
+      siws: true,
+      strictMode: true,
+    });
+
+    await waitFor(() =>
+      expect(walletHooks.setSolanaModalVisible).toHaveBeenCalledTimes(1),
+    );
+    expect(props.onAutoStartHandled).toHaveBeenCalledTimes(1);
+    expect(props.onLoadingChange.mock.calls).toEqual([["solana"]]);
+
+    walletHooks.solanaModalVisible = true;
+    rerenderWalletButtons();
+    walletHooks.solanaModalVisible = false;
+    walletHooks.solanaWallet.connecting = true;
+    rerenderWalletButtons();
+    walletHooks.solanaWallet.connecting = false;
+    walletHooks.solanaWallet.connected = true;
+    walletHooks.solanaWallet.publicKey = {
+      toBase58: () => "strict-mode-solana-account",
+    };
+    walletHooks.solanaWallet.signMessage = vi
+      .fn()
+      .mockResolvedValue(new Uint8Array([13, 14, 15]));
+    rerenderWalletButtons();
+
+    await waitFor(() => expect(signInWithSolana).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(props.onLoadingChange).toHaveBeenLastCalledWith(null),
+    );
+  });
 });

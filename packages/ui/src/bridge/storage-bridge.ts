@@ -13,6 +13,7 @@
 import { Capacitor } from "@capacitor/core";
 import { logger } from "@elizaos/logger";
 import {
+  registerStewardTokenCompareAndRestore,
   registerStewardTokenPersistence,
   registerStewardTokenRemoval,
   STEWARD_TOKEN_KEY,
@@ -162,6 +163,63 @@ function serializedProtectedStoreDelete(key: string): Promise<void> {
   return serializeProtectedStorageMutation(key, () =>
     protectedStoreDelete(key),
   );
+}
+
+function compareAndRestoreProtectedStorageCache(
+  key: string,
+  expectedValue: string,
+  restoreValue: string | null,
+): void {
+  if (protectedStorageCache.get(key) !== expectedValue) return;
+  if (restoreValue === null) {
+    protectedStorageCache.delete(key);
+  } else {
+    protectedStorageCache.set(key, restoreValue);
+  }
+}
+
+function compareAndRestoreStorageValue(
+  key: string,
+  expectedValue: string,
+  restoreValue: string | null,
+): Promise<boolean> {
+  if (!isProtectedStorageHost() || !PROTECTED_STORAGE_KIND.has(key)) {
+    if (window.localStorage.getItem(key) !== expectedValue) {
+      return Promise.resolve(false);
+    }
+    runAsPrivilegedShell(() => {
+      if (restoreValue === null) {
+        window.localStorage.removeItem(key);
+      } else {
+        window.localStorage.setItem(key, restoreValue);
+      }
+    });
+    return Promise.resolve(true);
+  }
+
+  markProtectedStorageMutation(key);
+  return serializeProtectedStorageMutation(key, async () => {
+    const currentValue = await protectedStoreGet(key);
+    if (currentValue !== expectedValue) {
+      compareAndRestoreProtectedStorageCache(key, expectedValue, currentValue);
+      return false;
+    }
+
+    if (restoreValue === null) {
+      await protectedStoreDelete(key);
+      if ((await protectedStoreGet(key)) !== null) {
+        throw new Error(`Protected storage rejected rollback for ${key}`);
+      }
+    } else {
+      const restored = await protectedStoreSet(key, restoreValue);
+      if (!restored || (await protectedStoreGet(key)) !== restoreValue) {
+        throw new Error(`Protected storage rejected rollback for ${key}`);
+      }
+    }
+
+    compareAndRestoreProtectedStorageCache(key, expectedValue, restoreValue);
+    return true;
+  });
 }
 
 function isProtectedStorageHost(): boolean {
@@ -751,4 +809,7 @@ export function isStorageBridgeInitialized(): boolean {
 registerStewardTokenRemoval(() => removeStorageValue(STEWARD_TOKEN_KEY));
 registerStewardTokenPersistence((token) =>
   setStorageValue(STEWARD_TOKEN_KEY, token),
+);
+registerStewardTokenCompareAndRestore((expectedToken, restoreToken) =>
+  compareAndRestoreStorageValue(STEWARD_TOKEN_KEY, expectedToken, restoreToken),
 );

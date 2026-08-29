@@ -91,9 +91,10 @@ vi.mock("./wallet-connect-project-id", () => ({
 
 import { StewardWalletProviders } from "./steward-wallet-providers";
 
-function renderProviders(
-  options: { enableEvm?: boolean; enableSolana?: boolean } = {},
-) {
+function renderProviders(options: {
+  enableEvm: boolean;
+  enableSolana: boolean;
+}) {
   return render(
     <StewardWalletProviders {...options}>
       <div data-testid="provider-child">Child</div>
@@ -128,8 +129,8 @@ describe("StewardWalletProviders capability gating", () => {
     cleanup();
   });
 
-  it("preserves the full provider tree by default for billing callers", () => {
-    renderProviders();
+  it("preserves the explicitly requested full provider tree for billing callers", () => {
+    renderProviders({ enableEvm: true, enableSolana: true });
 
     expect(screen.getByTestId("provider-child")).toBeTruthy();
     expect(screen.getByTestId("wagmi-provider")).toBeTruthy();
