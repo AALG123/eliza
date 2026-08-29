@@ -10,11 +10,31 @@ import { expect, type Page, type TestInfo, test } from "@playwright/test";
 import { saveBrowserVideoArtifact } from "./helpers/video-artifacts";
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "../../../..");
+const RECORDING = process.env.E2E_RECORD === "1";
 const EXPECTED_HEAD = execFileSync("git", ["rev-parse", "HEAD"], {
   cwd: REPO_ROOT,
   encoding: "utf8",
 }).trim();
-const RECORDING = process.env.E2E_RECORD === "1";
+
+function assertRecordedSourceProvenance(): void {
+  if (!RECORDING) return;
+
+  const sourceStatus = execFileSync(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    },
+  ).trim();
+  if (sourceStatus !== "") {
+    throw new Error(
+      "Recorded evidence requires a clean tracked and untracked source tree",
+    );
+  }
+}
+
+assertRecordedSourceProvenance();
 const PROVIDERS_CACHE_KEY = "eliza.steward.providers.v1:elizacloud";
 
 const VIEWPORTS = [
@@ -205,6 +225,8 @@ async function finishEvidence(
   observed: Observations,
   walletMethods: readonly string[],
 ): Promise<void> {
+  if (!RECORDING) return;
+
   const logPath = testInfo.outputPath(`${viewport.name}-frontend-network.log`);
   await mkdir(testInfo.outputDir, { recursive: true });
   await writeFile(
@@ -232,7 +254,6 @@ async function finishEvidence(
     contentType: "text/plain",
   });
 
-  if (!RECORDING) return;
   const video = page.video();
   await page.close();
   if (!video) return;
@@ -410,6 +431,9 @@ for (const viewport of VIEWPORTS) {
     await expect(
       page.getByRole("button", { name: /Continue with a wallet/i }),
     ).toHaveCount(0);
+    await expect(page.locator("#steward-wallet-options")).toHaveCount(0);
+    expect(observed.walletChunkRequests).toEqual([]);
+    expect(await readWalletMethods(page)).toEqual([]);
 
     authority.releaseRetrySuccess();
     const walletToggle = page.getByRole("button", {
