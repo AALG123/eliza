@@ -27,9 +27,15 @@ interface ClientConfig {
   statement_timeout?: number;
 }
 
-interface RuntimePgClient extends IdentityQueryClient {
+export interface RuntimePgClient extends IdentityQueryClient {
   connect(): Promise<void>;
   end(): Promise<void>;
+}
+
+export interface DatabaseIdentityReporterDependencies {
+  createClient?: (databaseUrl: string) => Promise<RuntimePgClient>;
+  publishResult?: typeof publishDatabaseIdentityResult;
+  writeStdout?: (message: string) => void;
 }
 
 const { Client } = createRequire(import.meta.url)("pg") as {
@@ -209,6 +215,12 @@ async function clientConfig(databaseUrl: string): Promise<ClientConfig> {
   };
 }
 
+async function createRuntimePgClient(
+  databaseUrl: string,
+): Promise<RuntimePgClient> {
+  return new Client(await clientConfig(databaseUrl));
+}
+
 /** Formats a redacted receipt for operator logs and GitHub step summaries. */
 function formatDatabaseIdentitySummary(
   result: IdentityPreflightResult,
@@ -260,22 +272,31 @@ export async function publishDatabaseIdentityResult(
   }
 }
 
-async function main(): Promise<void> {
-  const environment: Readonly<Record<string, string | undefined>> = process.env;
+/** Runs the standalone reporter and returns its process exit status. */
+export async function runDatabaseIdentityReporter(
+  environment: Readonly<Record<string, string | undefined>> = process.env,
+  dependencies: DatabaseIdentityReporterDependencies = {},
+): Promise<number> {
+  const createClient = dependencies.createClient ?? createRuntimePgClient;
+  const publishResult =
+    dependencies.publishResult ?? publishDatabaseIdentityResult;
+  const writeStdout =
+    dependencies.writeStdout ??
+    ((message: string) => process.stdout.write(message));
   const config = readDatabaseIdentityConfig(environment);
   if (config.mode === "off") {
-    process.stdout.write(
+    writeStdout(
       "[database-identity] gate disabled; no database query performed\n",
     );
-    return;
+    return 0;
   }
   const databaseUrl = environment.DATABASE_URL;
   if (!databaseUrl) {
     if (config.mode === "report") {
-      process.stdout.write(
+      writeStdout(
         "::warning::database identity report unavailable: DATABASE_URL is missing\n",
       );
-      return;
+      return 1;
     }
     throw new Error(
       "DATABASE_URL is required when database identity enforcement is active",
@@ -283,18 +304,19 @@ async function main(): Promise<void> {
   }
   let client: RuntimePgClient | undefined;
   try {
-    client = new Client(await clientConfig(databaseUrl));
+    client = await createClient(databaseUrl);
     await client.connect();
     const result = await runDatabaseIdentityPreflight(config, client);
-    await publishDatabaseIdentityResult(config, result, environment);
+    await publishResult(config, result, environment);
+    return result.status === "unavailable" ? 1 : 0;
   } catch (error) {
     // error-policy:J1 the CLI boundary emits only a generic class so provider
     // errors cannot leak connection strings, hosts, roles, or database names.
     if (config.mode === "report") {
-      process.stdout.write(
+      writeStdout(
         "::warning::database identity report unavailable; inspect protected operator logs\n",
       );
-      return;
+      return 1;
     }
     throw error;
   } finally {
@@ -308,10 +330,15 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(() => {
-    process.stderr.write(
-      "[database-identity] fatal: identity enforcement failed\n",
-    );
-    process.exit(1);
-  });
+  runDatabaseIdentityReporter().then(
+    (exitCode) => {
+      process.exitCode = exitCode;
+    },
+    () => {
+      process.stderr.write(
+        "[database-identity] fatal: identity enforcement failed\n",
+      );
+      process.exitCode = 1;
+    },
+  );
 }
