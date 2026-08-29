@@ -556,9 +556,11 @@ function loadStewardProviders(auth: {
   // Do not short-circuit from cachedStewardProviders here. The cache may seed
   // first paint, but only live discovery may authorize wallet provider mounts
   // and their persisted-session auto-reconnect behavior. The SDK also caches
-  // this endpoint for five minutes, so force the transport request: treating
-  // that cache hit as "live" could re-authorize a provider revoked while this
-  // document was suspended in BFCache.
+  // this endpoint for five minutes, so force the transport request. Our pinned
+  // SDK patch gives forced discovery `cache: "no-store"` as well: bypassing
+  // only its memory cache would still let the browser replay the endpoint's
+  // public max-age response after a BFCache restore and re-authorize a revoked
+  // provider.
   const requestGeneration = stewardProvidersRequestGeneration;
   stewardProvidersPromise ??= auth.getProviders(true).then(
     (loadedProviders) => {

@@ -431,6 +431,16 @@ function EthereumButton({
               }
               const signature = await signMessage(message);
               throwIfWalletIntentExpired(isIntentCurrent, generation);
+              const authorityAfterSign = requireSupportedEvmAuthority(
+                await readAuthority(),
+                addr,
+              );
+              throwIfWalletIntentExpired(isIntentCurrent, generation);
+              if (authorityAfterSign.chainId !== initialAuthority.chainId) {
+                throw new Error(
+                  `Ethereum wallet chain changed from ${initialAuthority.chainId} to ${authorityAfterSign.chainId} while signing.`,
+                );
+              }
               return signature;
             },
             initialAuthority.chainId,
@@ -469,7 +479,11 @@ function EthereumButton({
         addr,
         async () => await readConnectorAuthority(activeConnector),
         async (message: string) => {
-          return await signMessageAsync({ message });
+          return await signMessageAsync({
+            account: addr,
+            connector: activeConnector,
+            message,
+          });
         },
         generation,
       );
