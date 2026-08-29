@@ -35,6 +35,7 @@ const oauthState = vi.hoisted(() => ({
 vi.mock("@capacitor/core", () => ({
   Capacitor: {
     isNativePlatform: () => oauthState.nativePlatform,
+    registerPlugin: () => ({}),
   },
   registerPlugin: () => ({}),
 }));
@@ -155,6 +156,11 @@ vi.mock("../../../shell/steward-config", () => ({
 vi.mock("../../../shell/CloudI18nProvider", () => ({
   useCloudT: () => (_key: string, opts?: { defaultValue?: string }) =>
     opts?.defaultValue ?? _key,
+}));
+
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
 }));
 
 vi.mock("../../lib/steward-session", () => ({

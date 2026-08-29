@@ -88,6 +88,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     options?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("../../lib/steward-session", () => ({
   // The real peek returns true for a `#token=` hash; the strip is doubled with
   // a spy (its own unit tests live in lib/steward-session.hash-strip.test.ts).

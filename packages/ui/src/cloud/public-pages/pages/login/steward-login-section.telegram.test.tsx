@@ -96,6 +96,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     opts?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("../../lib/login-return-to", () => ({
   resolveLoginReturnTo: () => "/cloud",
   consumePendingOAuthReturnTo: () => null,

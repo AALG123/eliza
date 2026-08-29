@@ -72,6 +72,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     opts?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("@elizaos/shared/steward-session-client", async (importOriginal) => ({
   ...(await importOriginal<
     typeof import("@elizaos/shared/steward-session-client")

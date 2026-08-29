@@ -118,6 +118,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     options?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("../../lib/steward-email-login", () => ({
   StewardEmailLoginError: class StewardEmailLoginError extends Error {},
   startStewardEmailLogin: vi.fn(),

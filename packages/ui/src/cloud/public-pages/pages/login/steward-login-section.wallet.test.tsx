@@ -75,6 +75,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     opts?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("../../lib/steward-oauth-url", async () => {
   const actual = await vi.importActual<
     typeof import("../../lib/steward-oauth-url")
@@ -96,11 +101,9 @@ vi.mock("../../lib/login-return-to", () => ({
   storePendingOAuthReturnTo: () => undefined,
 }));
 
-// The section module-caches the providers fetch (`cachedStewardProviders`),
-// so each test must import a FRESH module instance or the first test's flags
-// leak into the rest.
+// Live discovery replaces the paint-only provider cache on every mount. Keep
+// one React/module graph so user events update the renderer under React 19.
 async function renderSection() {
-  vi.resetModules();
   const { default: StewardLoginSection } = await import(
     "./steward-login-section"
   );

@@ -100,6 +100,11 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
     opts?.defaultValue ?? _key,
 }));
 
+vi.mock("../../../sso-bridge/sso-bridge", () => ({
+  clearSsoLoggedOut: vi.fn(),
+  prepareSsoAccountSwitch: vi.fn(),
+}));
+
 vi.mock("../../lib/steward-session", () => ({
   hasStewardOAuthCallbackInUrl: () => false,
   consumeStewardCodeFromQuery: () => null,
@@ -142,10 +147,10 @@ vi.mock("./wallet-buttons", () => ({
   },
 }));
 
-// The section caches provider discovery at module scope. Import a fresh module
-// for each case so one test's served chains cannot leak into the next case.
+// Live discovery is the wallet authority. Keep one React/module graph for the
+// file: resetting modules here creates a second React instance and makes event
+// updates disappear from the renderer after the section gained the SSO bridge.
 async function renderSection() {
-  vi.resetModules();
   const { default: StewardLoginSection } = await import(
     "./steward-login-section"
   );
