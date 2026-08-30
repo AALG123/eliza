@@ -71,6 +71,36 @@ export interface PersonalDedicatedSelectionExecuteInput extends PersonalDedicate
   expectedStateDisposition: PersonalDedicatedStateDisposition;
 }
 
+export interface PersonalDedicatedSelectionReviewInput {
+  organizationId: string;
+  userId: string;
+  sourceAgentId: string;
+}
+
+export interface PersonalDedicatedSelectionReviewPreview {
+  currentInventoryFingerprint: string;
+  receiptInventoryFingerprint: string;
+  receiptUpdatedAt: string;
+  retainedStatus: AgentSandboxStatus;
+  retainedLifecycleRevision: number;
+  stateDisposition: PersonalDedicatedStateDisposition;
+  candidateCount: number;
+  receiptCurrent: boolean;
+  startsCompute: false;
+  createsJob: false;
+  deletesRows: false;
+  changesCutover: false;
+}
+
+export interface PersonalDedicatedSelectionReviewExecuteInput
+  extends PersonalDedicatedSelectionReviewInput {
+  expectedReceiptInventoryFingerprint: string;
+  expectedReceiptUpdatedAt: string;
+  expectedCurrentInventoryFingerprint: string;
+  expectedCurrentStateDisposition: PersonalDedicatedStateDisposition;
+  expectedCurrentCandidateCount: number;
+}
+
 function selectionError(
   code:
     | "PERSONAL_DEDICATED_SELECTION_NOT_FOUND"
@@ -79,10 +109,8 @@ function selectionError(
     | "PERSONAL_DEDICATED_SELECTION_INVENTORY_CHANGED"
     | "PERSONAL_DEDICATED_SELECTION_ACTIVE_JOB",
   message: string,
-  params: Pick<
-    PersonalDedicatedSelectionInput,
-    "organizationId" | "userId" | "sourceAgentId" | "retainedAgentId"
-  >,
+  params: Pick<PersonalDedicatedSelectionInput, "organizationId" | "userId" | "sourceAgentId"> &
+    Partial<Pick<PersonalDedicatedSelectionInput, "retainedAgentId">>,
 ): PersonalDedicatedSelectionError {
   return new PersonalDedicatedSelectionError(message, {
     code,
@@ -93,6 +121,20 @@ function selectionError(
       retainedAgentId: params.retainedAgentId,
     },
   });
+}
+
+function selectionReviewError(
+  code:
+    | "PERSONAL_DEDICATED_SELECTION_NOT_FOUND"
+    | "PERSONAL_DEDICATED_SELECTION_NOT_AMBIGUOUS"
+    | "PERSONAL_DEDICATED_SELECTION_CONFLICT"
+    | "PERSONAL_DEDICATED_SELECTION_INVENTORY_CHANGED"
+    | "PERSONAL_DEDICATED_SELECTION_ACTIVE_JOB",
+  message: string,
+  params: PersonalDedicatedSelectionReviewInput,
+  retainedAgentId?: string,
+): PersonalDedicatedSelectionError {
+  return selectionError(code, message, { ...params, retainedAgentId });
 }
 
 function unselectedCandidateWhere(organizationId: string, userId: string) {
@@ -674,7 +716,329 @@ export async function executePersonalDedicatedSelection(
   }
 }
 
+function assertReviewableSelectedInventory(
+  params: PersonalDedicatedSelectionReviewInput,
+  selection: typeof personalDedicatedAdoptionSelections.$inferSelect,
+  candidates: AgentSandbox[],
+): AgentSandbox {
+  if (selection.restore_fence_hash || selection.restore_fence_started_at) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_CONFLICT",
+      "The selected Dedicated receipt has active restore ownership",
+      params,
+      selection.dedicated_agent_id,
+    );
+  }
+  if (candidates.length > MAX_REVIEWABLE_CANDIDATES) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_CONFLICT",
+      "The Dedicated inventory exceeds the bounded review limit",
+      params,
+      selection.dedicated_agent_id,
+    );
+  }
+  const retained = candidates.find((candidate) => candidate.id === selection.dedicated_agent_id);
+  if (!retained) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_INVENTORY_CHANGED",
+      "The selected Dedicated candidate is no longer eligible",
+      params,
+      selection.dedicated_agent_id,
+    );
+  }
+  if (candidates.length < 2) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_NOT_AMBIGUOUS",
+      "The owner inventory no longer contains multiple eligible Dedicated candidates",
+      params,
+      selection.dedicated_agent_id,
+    );
+  }
+  return retained;
+}
+
+function selectedReceiptIsCurrent(
+  params: PersonalDedicatedSelectionReviewInput,
+  selection: typeof personalDedicatedAdoptionSelections.$inferSelect,
+  retained: AgentSandbox,
+  candidates: AgentSandbox[],
+  backups: PersonalDedicatedBackupProvenance[],
+  currentInventoryFingerprint: string,
+): boolean {
+  const currentActivationAuthority = personalDedicatedActivationAuthority(
+    params.organizationId,
+    retained.id,
+    backups,
+  );
+  const receiptActivationAuthority = personalDedicatedActivationAuthorityFromReceipt(
+    selection.activation_kind,
+    selection.activation_backup_id,
+    selection.activation_backup_hash,
+    selection.activation_backup_chain,
+  );
+  return (
+    candidates.length === selection.candidate_count &&
+    currentInventoryFingerprint === selection.inventory_fingerprint &&
+    personalDedicatedStateDisposition(params.organizationId, retained.id, backups) ===
+      selection.state_disposition &&
+    personalDedicatedActivationAuthorityKey(currentActivationAuthority) ===
+      personalDedicatedActivationAuthorityKey(receiptActivationAuthority)
+  );
+}
+
+async function assertNoExistingUpgradeAuthority(
+  query: Pick<DbTransaction, "select"> | typeof dbWrite,
+  params: PersonalDedicatedSelectionReviewInput,
+): Promise<void> {
+  const [authority] = await query
+    .select({ id: personalDedicatedUpgradeAuthorities.id })
+    .from(personalDedicatedUpgradeAuthorities)
+    .where(
+      and(
+        eq(personalDedicatedUpgradeAuthorities.organization_id, params.organizationId),
+        eq(personalDedicatedUpgradeAuthorities.user_id, params.userId),
+        eq(personalDedicatedUpgradeAuthorities.source_agent_id, params.sourceAgentId),
+      ),
+    )
+    .limit(1);
+  if (authority) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_CONFLICT",
+      "This personal Dedicated source is already adopted",
+      params,
+    );
+  }
+}
+
+function selectionReviewPreview(
+  params: PersonalDedicatedSelectionReviewInput,
+  selection: typeof personalDedicatedAdoptionSelections.$inferSelect,
+  retained: AgentSandbox,
+  candidates: AgentSandbox[],
+  backups: PersonalDedicatedBackupProvenance[],
+  currentInventoryFingerprint: string,
+  receiptUpdatedAt = selection.updated_at,
+): PersonalDedicatedSelectionReviewPreview {
+  return {
+    currentInventoryFingerprint,
+    receiptInventoryFingerprint: selection.inventory_fingerprint,
+    receiptUpdatedAt: receiptUpdatedAt.toISOString(),
+    retainedStatus: retained.status,
+    retainedLifecycleRevision: retained.lifecycle_revision,
+    stateDisposition: personalDedicatedStateDisposition(
+      params.organizationId,
+      retained.id,
+      backups,
+    ),
+    candidateCount: candidates.length,
+    receiptCurrent: selectedReceiptIsCurrent(
+      params,
+      selection,
+      retained,
+      candidates,
+      backups,
+      currentInventoryFingerprint,
+    ),
+    startsCompute: false,
+    createsJob: false,
+    deletesRows: false,
+    changesCutover: false,
+  };
+}
+
+/** Recomputes the current review facts for the already selected target. */
+export async function previewPersonalDedicatedSelectionReview(
+  params: PersonalDedicatedSelectionReviewInput,
+): Promise<PersonalDedicatedSelectionReviewPreview> {
+  const [selection] = await dbWrite
+    .select()
+    .from(personalDedicatedAdoptionSelections)
+    .where(
+      and(
+        eq(personalDedicatedAdoptionSelections.organization_id, params.organizationId),
+        eq(personalDedicatedAdoptionSelections.user_id, params.userId),
+        eq(personalDedicatedAdoptionSelections.source_agent_id, params.sourceAgentId),
+        eq(personalDedicatedAdoptionSelections.schema_version, 1),
+      ),
+    )
+    .limit(1);
+  if (!selection) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_NOT_FOUND",
+      "No existing Dedicated selection receipt was found",
+      params,
+    );
+  }
+  await assertNoExistingUpgradeAuthority(dbWrite, params);
+  const candidates = await dbWrite
+    .select()
+    .from(agentSandboxes)
+    .where(adoptableUnmarkedTargetWhere(params.organizationId, params.userId))
+    .orderBy(asc(agentSandboxes.id))
+    .limit(MAX_REVIEWABLE_CANDIDATES + 1);
+  const retained = assertReviewableSelectedInventory(params, selection, candidates);
+  const activeJob = await findActiveCandidateLifecycleJob(
+    dbWrite,
+    params.organizationId,
+    candidates.map((candidate) => candidate.id),
+  );
+  if (activeJob) {
+    throw selectionReviewError(
+      "PERSONAL_DEDICATED_SELECTION_ACTIVE_JOB",
+      "The reviewed Dedicated inventory has active lifecycle work",
+      params,
+      selection.dedicated_agent_id,
+    );
+  }
+  const backups = await readBackupProvenance(candidates.map((candidate) => candidate.id));
+  const currentInventoryFingerprint = await personalDedicatedInventoryFingerprint({
+    ...params,
+    retainedAgentId: selection.dedicated_agent_id,
+    candidates,
+    backups,
+  });
+  return selectionReviewPreview(
+    params,
+    selection,
+    retained,
+    candidates,
+    backups,
+    currentInventoryFingerprint,
+  );
+}
+
+/** Refreshes only the review fields of the existing selection receipt. */
+export async function executePersonalDedicatedSelectionReview(
+  params: PersonalDedicatedSelectionReviewExecuteInput,
+): Promise<PersonalDedicatedSelectionReviewPreview> {
+  return await dbWrite.transaction(async (tx) => {
+    await configureElizaLifecycleTransaction(tx);
+    await tx.execute(elizaAgentCreateAdvisoryLockSql(params.organizationId));
+    await tx.execute(
+      elizaAgentTierUpgradeAdvisoryLockSql(params.organizationId, params.sourceAgentId),
+    );
+
+    const [selection] = await tx
+      .select()
+      .from(personalDedicatedAdoptionSelections)
+      .where(
+        and(
+          eq(personalDedicatedAdoptionSelections.organization_id, params.organizationId),
+          eq(personalDedicatedAdoptionSelections.user_id, params.userId),
+          eq(personalDedicatedAdoptionSelections.source_agent_id, params.sourceAgentId),
+          eq(personalDedicatedAdoptionSelections.schema_version, 1),
+        ),
+      )
+      .limit(1)
+      .for("update");
+    if (!selection) {
+      throw selectionReviewError(
+        "PERSONAL_DEDICATED_SELECTION_NOT_FOUND",
+        "No existing Dedicated selection receipt was found",
+        params,
+      );
+    }
+    if (
+      selection.inventory_fingerprint !== params.expectedReceiptInventoryFingerprint ||
+      selection.updated_at.toISOString() !== params.expectedReceiptUpdatedAt
+    ) {
+      throw selectionReviewError(
+        "PERSONAL_DEDICATED_SELECTION_INVENTORY_CHANGED",
+        "The Dedicated selection receipt changed after review",
+        params,
+        selection.dedicated_agent_id,
+      );
+    }
+    await assertNoExistingUpgradeAuthority(tx, params);
+
+    const candidates = await readCurrentEligibleCandidatesInTx(tx, {
+      ...params,
+      retainedAgentId: selection.dedicated_agent_id,
+      selectedByUserId: selection.selected_by_user_id,
+      reason: SELECTION_REASON,
+    });
+    const retained = assertReviewableSelectedInventory(params, selection, candidates);
+    const backups = await readBackupProvenanceInTx(
+      tx,
+      candidates.map((candidate) => candidate.id),
+    );
+    const currentInventoryFingerprint = await personalDedicatedInventoryFingerprint({
+      ...params,
+      retainedAgentId: selection.dedicated_agent_id,
+      candidates,
+      backups,
+    });
+    const stateDisposition = personalDedicatedStateDisposition(
+      params.organizationId,
+      retained.id,
+      backups,
+    );
+    if (
+      currentInventoryFingerprint !== params.expectedCurrentInventoryFingerprint ||
+      stateDisposition !== params.expectedCurrentStateDisposition ||
+      candidates.length !== params.expectedCurrentCandidateCount
+    ) {
+      throw selectionReviewError(
+        "PERSONAL_DEDICATED_SELECTION_INVENTORY_CHANGED",
+        "The Dedicated inventory changed after review",
+        params,
+        selection.dedicated_agent_id,
+      );
+    }
+    const activeJob = await findActiveCandidateLifecycleJob(
+      tx,
+      params.organizationId,
+      candidates.map((candidate) => candidate.id),
+    );
+    if (activeJob) {
+      throw selectionReviewError(
+        "PERSONAL_DEDICATED_SELECTION_ACTIVE_JOB",
+        "The reviewed Dedicated inventory has active lifecycle work",
+        params,
+        selection.dedicated_agent_id,
+      );
+    }
+
+    const activationAuthority = personalDedicatedActivationAuthority(
+      params.organizationId,
+      retained.id,
+      backups,
+    );
+    const updatedAt = new Date();
+    await tx
+      .update(personalDedicatedAdoptionSelections)
+      .set({
+        state_disposition: stateDisposition,
+        ...personalDedicatedActivationAuthorityReceiptColumns(activationAuthority),
+        inventory_fingerprint: currentInventoryFingerprint,
+        candidate_count: candidates.length,
+        updated_at: updatedAt,
+      })
+      .where(eq(personalDedicatedAdoptionSelections.id, selection.id));
+
+    const refreshedSelection = {
+      ...selection,
+      state_disposition: stateDisposition,
+      ...personalDedicatedActivationAuthorityReceiptColumns(activationAuthority),
+      inventory_fingerprint: currentInventoryFingerprint,
+      candidate_count: candidates.length,
+      updated_at: updatedAt,
+    };
+    return selectionReviewPreview(
+      params,
+      refreshedSelection,
+      retained,
+      candidates,
+      backups,
+      currentInventoryFingerprint,
+      updatedAt,
+    );
+  });
+}
+
 export const personalDedicatedAdoptionSelectionService = {
   preview: previewPersonalDedicatedSelection,
   execute: executePersonalDedicatedSelection,
+  previewReview: previewPersonalDedicatedSelectionReview,
+  executeReview: executePersonalDedicatedSelectionReview,
 };

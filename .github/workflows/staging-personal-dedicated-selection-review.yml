@@ -1,0 +1,87 @@
+name: Staging personal Dedicated selection review
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_develop_commit:
+        description: Exact 40-character develop commit to review
+        required: true
+        type: string
+      mode:
+        description: Preview or refresh only the existing selection receipt
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - apply
+      confirmation:
+        description: Exact side-effect denial phrase required only for apply
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: staging
+    concurrency:
+      group: staging-personal-dedicated-selection-review
+      cancel-in-progress: false
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ELIZAOS_CLOUD_API_KEY: ${{ secrets.ELIZAOS_CLOUD_API_KEY || secrets.ELIZACLOUD_API_KEY }}
+      ELIZA_CLOUD_ENVIRONMENT: staging
+      STAGING_SELECTION_REVIEW_MODE: ${{ inputs.mode }}
+      STAGING_SELECTION_REVIEW_CONFIRMATION: ${{ inputs.confirmation }}
+
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Require exact develop commit and explicit apply intent
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_develop_commit }}
+          CHECKED_OUT_COMMIT: ${{ github.sha }}
+          SOURCE_REF: ${{ github.ref }}
+          REVIEW_MODE: ${{ inputs.mode }}
+          REVIEW_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          bun -e '
+            const expected = process.env.EXPECTED_COMMIT ?? "";
+            const checkedOut = process.env.CHECKED_OUT_COMMIT ?? "";
+            if (process.env.SOURCE_REF !== "refs/heads/develop") process.exit(1);
+            if (!/^[0-9a-f]{40}$/.test(expected)) process.exit(1);
+            if (expected !== checkedOut) process.exit(1);
+            const mode = process.env.REVIEW_MODE;
+            if (mode !== "dry-run" && mode !== "apply") process.exit(1);
+            if (
+              mode === "apply" &&
+              process.env.REVIEW_CONFIRMATION !==
+                "refresh_without_provisioning_billing_cutover_or_deletion"
+            ) process.exit(1);
+          '
+
+      - name: Install deterministic dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Validate selection review and workflow contracts
+        run: |
+          bun test packages/cloud/scripts/admin/staging-personal-dedicated-selection-review.test.ts --coverage-reporter=lcov --coverage-dir=/tmp/selection-review-script-coverage
+          bun test packages/cloud/api/__tests__/admin-personal-dedicated-adoption-selection.pglite.test.ts --test-name-pattern "re-reviews the same|fails closed when inventory changes between re-review|rejects re-review" --coverage-reporter=lcov --coverage-dir=/tmp/selection-review-service-coverage
+
+      - name: Review existing staging selection receipt
+        run: bun run packages/cloud/scripts/admin/staging-personal-dedicated-selection-review.ts
