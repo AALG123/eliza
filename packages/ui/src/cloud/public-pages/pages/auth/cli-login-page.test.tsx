@@ -127,6 +127,7 @@ beforeEach(() => {
   searchParamsRef.current = new URLSearchParams("session=sess-1");
   resetSessionAuth();
   sessionStorage.clear();
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -206,7 +207,7 @@ describe("CliLoginPage", () => {
     expect(apiFetchMock).not.toHaveBeenCalled();
   });
 
-  it("requires fresh confirmation after a session link changes away and back", async () => {
+  it("replays terminal state for a completed session without minting a second key", async () => {
     const user = userEvent.setup();
     authenticate();
     apiFetchMock.mockResolvedValue({
@@ -229,14 +230,11 @@ describe("CliLoginPage", () => {
     rerender(<CliLoginPage />);
     await waitFor(() =>
       expect(
-        screen.getByRole("heading", { name: "Authorize CLI Sign-In?" }),
+        screen.getByRole("heading", { name: "Authentication Complete!" }),
       ).toBeTruthy(),
     );
     await Promise.resolve();
     expect(apiFetchMock).toHaveBeenCalledTimes(1);
-
-    await user.click(screen.getByRole("button", { name: "Authorize" }));
-    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
   });
 
   it("Cancel abandons the flow with no POST and a distinct cancelled state", async () => {
@@ -278,10 +276,12 @@ describe("CliLoginPage", () => {
     );
     expect(apiFetchMock).toHaveBeenCalledTimes(1);
     expect(postMessage).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "Close window" })).toBeTruthy();
     expect(
-      screen.queryByRole("link", { name: "Continue to dashboard" }),
-    ).toBeNull();
+      screen
+        .getByRole("link", { name: "Return to Eliza" })
+        .getAttribute("href"),
+    ).toBe("/");
+    expect(screen.queryByRole("button", { name: "Close window" })).toBeNull();
     expect(screen.queryByText("API Key Details")).toBeNull();
     expect(screen.queryByText("ek_live_abc")).toBeNull();
     expect(navigateMock).not.toHaveBeenCalled();
