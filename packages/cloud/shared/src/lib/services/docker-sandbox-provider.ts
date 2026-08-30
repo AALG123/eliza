@@ -1017,6 +1017,19 @@ export function classifyDockerMeshJoinProbe(output: string): DockerMeshJoinProbe
   return { status: "pending" };
 }
 
+/**
+ * Retains every precise mesh failure behind the required-ingress verdict. The
+ * first cause is also the native `cause` so durable job diagnostics can walk
+ * through AggregateError without exposing its unrestricted `errors` payload.
+ */
+export function requiredHeadscaleIngressFailure(
+  message: string,
+  causes: readonly unknown[],
+): Error {
+  if (causes.length === 0) return new Error(message);
+  return new AggregateError([...causes], message, { cause: causes[0] });
+}
+
 async function probeDockerMeshJoinTerminalFailure(
   ssh: DockerSSHClient,
   containerId: string,
@@ -1047,16 +1060,19 @@ async function probeDockerMeshJoinTerminalFailure(
 
   const verdict = classifyDockerMeshJoinProbe(output);
   if (verdict.status === "pending") return null;
-  return new ElizaError("Docker candidate cannot complete required Headscale registration", {
-    code: "SANDBOX_MESH_JOIN_TERMINAL",
-    context: {
-      containerId,
-      reason: verdict.reason,
-      containerState: verdict.containerState,
-      exitCode: verdict.exitCode,
+  return new ElizaError(
+    `Docker candidate cannot complete required Headscale registration: ${verdict.reason}`,
+    {
+      code: "SANDBOX_MESH_JOIN_TERMINAL",
+      context: {
+        containerId,
+        reason: verdict.reason,
+        containerState: verdict.containerState,
+        exitCode: verdict.exitCode,
+      },
+      severity: "ephemeral",
     },
-    severity: "ephemeral",
-  });
+  );
 }
 
 /**
@@ -3036,7 +3052,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       if (replacementIntentPersisted) {
         throw new SandboxReplacementCleanupUnresolvedError(
           currentCleanupLocator(),
-          new Error(errorMessage),
+          requiredHeadscaleIngressFailure(errorMessage, remoteCompletionTracker?.causes ?? []),
         );
       }
       const cleanupLocator = currentCleanupLocator();
